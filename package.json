@@ -1,0 +1,16 @@
+{
+  "name": "glm-bridge",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Local OpenAI/Anthropic-compatible bridge for Z.ai GLM via a ZCode subscription",
+  "bin": { "glm-bridge": "glm-bridge.js" },
+  "scripts": {
+    "start": "node glm-bridge.js start",
+    "stop": "node glm-bridge.js stop",
+    "status": "node glm-bridge.js status",
+    "logs": "node glm-bridge.js logs"
+  },
+  "optionalDependencies": {
+    "playwright-core": "^1.55.0"
+  }
+}

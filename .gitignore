@@ -1,0 +1,16 @@
+# runtime state and secrets — never commit
+config.json
+tokens.json
+tokens-minted.json
+tokens-mint-*.json
+account-revision.json
+bridge.log
+bridge.pid
+bridge.out
+squashfs-root/
+node_modules/
+package-lock.json
+
+# extracted AppImage / ZCode resources
+zcode-root/
+*.AppImage
