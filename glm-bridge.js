@@ -33,23 +33,24 @@ const { spawn, execFileSync } = require('child_process');
 // ---------------------------------------------------------------- config ----
 const HOME = os.homedir();
 const IS_WIN = process.platform === 'win32';
-// State lives next to the installed script, so a dev checkout or a
-// GLM_BRIDGE_DIR install keeps its own key/tokens/logs.
-const APP_DIR = process.env.GLM_BRIDGE_HOME
+// Mutable state (key, tokens, logs) lives in STATE_DIR, which is the install dir
+// unless GLM_BRIDGE_HOME overrides it. Shipped assets always come from the
+// directory holding this script, so relocating state never breaks them.
+const STATE_DIR = process.env.GLM_BRIDGE_HOME
   ? path.resolve(process.env.GLM_BRIDGE_HOME)
-  : (path.basename(__dirname) === 'glm-bridge' ? __dirname : path.join(HOME, 'glm-bridge'));
-const CONFIG_PATH = path.join(APP_DIR, 'config.json');
-const TOKENS_PATH = path.join(APP_DIR, 'tokens.json');
-const CACHE_PATH = path.join(APP_DIR, 'account-revision.json');
-const PID_PATH = path.join(APP_DIR, 'bridge.pid');
-const LOG_PATH = path.join(APP_DIR, 'bridge.log');
-// Windows ZCode desktop uses the same ~/.zcode layout (CLI data dir)
+  : __dirname;
+const ASSET_DIR = __dirname;
+const CONFIG_PATH = path.join(STATE_DIR, 'config.json');
+const TOKENS_PATH = path.join(STATE_DIR, 'tokens.json');
+const CACHE_PATH = path.join(STATE_DIR, 'account-revision.json');
+const PID_PATH = path.join(STATE_DIR, 'bridge.pid');
+const LOG_PATH = path.join(STATE_DIR, 'bridge.log');
+// ZCode keeps its CLI data in ~/.zcode on Linux, macOS and Windows alike
 const ZCODE_DIR = path.join(HOME, '.zcode');
-const ZCODE_V2 = IS_WIN ? path.join(ZCODE_DIR, 'v2') : path.join(ZCODE_DIR, 'v2');
-const CRED_PATH = path.join(ZCODE_V2, 'credentials.json');
+const CRED_PATH = path.join(ZCODE_DIR, 'v2', 'credentials.json');
 const WORKSPACE = path.join(ZCODE_DIR, 'workspace', 'default');
-const MINT_SCRIPT = path.join(APP_DIR, 'mint-captcha.js');
-const SYSBLOCKS_PATH = path.join(APP_DIR, 'sysblocks.json');
+const MINT_SCRIPT = path.join(ASSET_DIR, 'mint-captcha.js');
+const SYSBLOCKS_PATH = path.join(ASSET_DIR, 'sysblocks.json');
 const APPIMAGE = (() => {
   try {
     if (IS_WIN) {
@@ -73,7 +74,7 @@ const APPIMAGE = (() => {
   } catch { return null; }
 })();
 
-fs.mkdirSync(APP_DIR, { recursive: true });
+fs.mkdirSync(STATE_DIR, { recursive: true });
 
 function log(...a) {
   const line = `[${new Date().toISOString()}] ${a.join(' ')}\n`;
@@ -140,7 +141,7 @@ function ensureTokens(background = true) {
   if (minting || tokens.length >= 8) return;
   if (!fs.existsSync(MINT_SCRIPT)) { log('mint script missing:', MINT_SCRIPT); return; }
   minting = true;
-  const out = path.join(APP_DIR, `tokens-mint-${Date.now()}.json`);
+  const out = path.join(STATE_DIR, `tokens-mint-${Date.now()}.json`);
   const p = spawn(process.execPath, [MINT_SCRIPT, '10', out], { stdio: ['ignore', 'pipe', 'pipe'] });
   p.stdout.on('data', d => log('[mint]', String(d).trim()));
   p.stderr.on('data', d => log('[mint:err]', String(d).trim().slice(0, 300)));
@@ -317,7 +318,7 @@ function resolveCliRoot() {
   if (process.env.GLM_BRIDGE_CLI) return process.env.GLM_BRIDGE_CLI;
   // Prefer our own extracted copy: it means the ZCode desktop can be closed
   // and the /tmp AppImage mount can disappear without breaking the bridge.
-  const extracted = path.join(APP_DIR, 'squashfs-root', 'resources', 'glm', 'zcode.cjs');
+  const extracted = path.join(ASSET_DIR, 'squashfs-root', 'resources', 'glm', 'zcode.cjs');
   if (fs.existsSync(extracted)) return extracted;
   if (IS_WIN) {
     // Windows: ZCode desktop (Electron) ships resources beside the exe
@@ -329,15 +330,15 @@ function resolveCliRoot() {
   if (mounted) {
     log('using live AppImage mount, extracting a private copy for offline use');
     try {
-      execFileSync(APPIMAGE || mounted, ['--appimage-extract'], { cwd: APP_DIR, stdio: 'pipe', timeout: 300_000 });
+      execFileSync(APPIMAGE || mounted, ['--appimage-extract'], { cwd: ASSET_DIR, stdio: 'pipe', timeout: 300_000 });
     } catch (e) { log('extract failed:', e.message.slice(0, 200)); }
     if (fs.existsSync(extracted)) return extracted;
     return mounted;
   }
   if (APPIMAGE) {
-    log('no AppImage mount, extracting once ->', APP_DIR);
+    log('no AppImage mount, extracting once ->', ASSET_DIR);
     try {
-      execFileSync(APPIMAGE, ['--appimage-extract'], { cwd: APP_DIR, stdio: 'pipe', timeout: 300_000 });
+      execFileSync(APPIMAGE, ['--appimage-extract'], { cwd: ASSET_DIR, stdio: 'pipe', timeout: 300_000 });
       if (fs.existsSync(extracted)) return extracted;
     } catch (e) { log('extract failed:', e.message.slice(0, 300)); }
   }
