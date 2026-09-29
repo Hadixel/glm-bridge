@@ -33,7 +33,11 @@ const { spawn, execFileSync } = require('child_process');
 // ---------------------------------------------------------------- config ----
 const HOME = os.homedir();
 const IS_WIN = process.platform === 'win32';
-const APP_DIR = path.join(HOME, 'glm-bridge');
+// State lives next to the installed script, so a dev checkout or a
+// GLM_BRIDGE_DIR install keeps its own key/tokens/logs.
+const APP_DIR = process.env.GLM_BRIDGE_HOME
+  ? path.resolve(process.env.GLM_BRIDGE_HOME)
+  : (path.basename(__dirname) === 'glm-bridge' ? __dirname : path.join(HOME, 'glm-bridge'));
 const CONFIG_PATH = path.join(APP_DIR, 'config.json');
 const TOKENS_PATH = path.join(APP_DIR, 'tokens.json');
 const CACHE_PATH = path.join(APP_DIR, 'account-revision.json');
@@ -997,9 +1001,54 @@ function spawnDetached() {
   return child.pid;
 }
 
+const SERVICE_NAME = 'glm-bridge';
 async function ctl() {
-  const pid = readPid();
-  const alive = pid && isAlive(pid);
+  // If something is already serving our port but the pid file is stale or
+  // missing, adopt that process so status/stop act on the real owner.
+  const adoptPortHolder = () => {
+    const holders = portHolders();
+    if (holders.length === 1) {
+      try { writePid(holders[0]); } catch { /* ignore */ }
+      return holders[0];
+    }
+    return null;
+  };
+  let pid = readPid();
+  let alive = !!(pid && isAlive(pid));
+  // If a service manager owns the bridge, delegate to it: otherwise systemd /
+  // the Scheduled Task would immediately resurrect a process we just killed.
+  const service = (() => {
+    if (IS_WIN) {
+      try {
+        execFileSync('schtasks', ['/Query', '/TN', SERVICE_NAME], { stdio: 'pipe' });
+        return { kind: 'schtasks', name: SERVICE_NAME };
+      } catch { return null; }
+    }
+    try {
+      execFileSync('systemctl', ['--user', 'cat', SERVICE_NAME + '.service'], { stdio: 'pipe' });
+      return { kind: 'systemd', name: SERVICE_NAME };
+    } catch { return null; }
+  })();
+  const svc = (action) => {
+    try {
+      if (service.kind === 'systemd') {
+        execFileSync('systemctl', ['--user', action, service.name], { stdio: 'pipe' });
+      } else if (action === 'start') {
+        execFileSync('schtasks', ['/Run', '/TN', service.name], { stdio: 'pipe' });
+      } else {
+        execFileSync('schtasks', ['/End', '/TN', service.name], { stdio: 'pipe' });
+      }
+    } catch { /* fall through to direct control */ }
+  };
+  const svcState = () => {
+    try {
+      if (service.kind === 'systemd') {
+        return execFileSync('systemctl', ['--user', 'is-active', service.name], { stdio: 'pipe' }).toString().trim();
+      }
+      execFileSync('schtasks', ['/Query', '/TN', service.name], { stdio: 'pipe' });
+      return 'running';
+    } catch { return 'inactive'; }
+  };
   const health = async () => {
     try {
       const r = await fetch(`http://127.0.0.1:${config.port}/health`, { signal: AbortSignal.timeout(2000) });
@@ -1007,15 +1056,26 @@ async function ctl() {
     } catch { return false; }
   };
   if (sub === 'start' || sub === 'restart') {
-    if (sub === 'restart') {
+    if (sub === 'start' && (await health())) {
+      console.log(alive ? `already running (pid ${pid})` : 'already running');
+      return;
+    }
+    if (service) {
+      svc(sub === 'restart' ? 'restart' : 'start');
+    } else if (sub === 'restart') {
       stop();
       await new Promise(r => setTimeout(r, 1200));
-    } else {
-      // A live instance (ours or a stale one holding the port) is enough.
-      if (await health()) {
-        console.log(alive ? `already running (pid ${pid})` : 'already running (adopted)');
-        return;
+    }
+    if (service) {
+      const deadline = Date.now() + 90_000;
+      while (Date.now() < deadline) {
+        if (await health()) { console.log(`started -> http://127.0.0.1:${config.port}/v1`); return; }
+        await new Promise(r => setTimeout(r, 400));
       }
+      console.error('start timed out; last log lines:');
+      try { console.log(fs.readFileSync(LOG_PATH, 'utf8').split('\n').filter(Boolean).slice(-6).join('\n')); } catch {}
+      process.exitCode = 1;
+      return;
     }
     const newPid = spawnDetached();
     const deadline = Date.now() + 60_000;
@@ -1031,10 +1091,12 @@ async function ctl() {
     try { console.log(fs.readFileSync(LOG_PATH, 'utf8').split('\n').filter(Boolean).slice(-6).join('\n')); } catch {}
     process.exitCode = 1;
   } else if (sub === 'stop') {
-    stop();
+    if (service) { svc('stop'); } else { stop(); }
   } else if (sub === 'status') {
     const up = await health();
-    console.log(up ? `running (pid ${alive ? pid : 'adopted'})` : 'stopped');
+    if (up && !alive) { const adopted = adoptPortHolder(); if (adopted) { pid = adopted; alive = true; } }
+    const via = service ? `${service.kind}:${svcState()}` : 'process';
+    console.log(up ? `running (pid ${pid || 'unknown'}, ${via})` : `stopped (${via})`);
     if (up) {
       try {
         const h = await (await fetch(`http://127.0.0.1:${config.port}/health`)).json();
