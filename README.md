@@ -22,9 +22,9 @@ Both install to `~/.glm-bridge`, put `glm-bridge` on your PATH, start it at
 login (systemd user unit on Linux, Scheduled Task on Windows), and register it
 with a local 9router if one is running.
 
-Requirements: **Node 22+** (the ZCode CLI needs `node:sqlite`), a **ZCode
-desktop login**, and Playwright Chromium for captcha minting (the installer
-handles it).
+Requirements: **Node 22+** (the ZCode CLI needs `node:sqlite`) and a **ZCode
+desktop login**. Playwright Chromium is only needed if the upstream re-enables
+captcha tokens on model requests (the installer sets it up anyway).
 
 ## Control
 
@@ -93,7 +93,7 @@ key:      any 9router API key
 | `POST /v1/messages/count_tokens` | estimate |
 
 Tool calling is supported in both formats. Requests are serialized upstream
-(the upstream captcha layer rejects duplicate concurrent submits).
+(the upstream rejects duplicate concurrent submits).
 
 ## Speed
 
@@ -117,9 +117,12 @@ Measured on a real request: `low` ≈ 3–5 s wall, versus ~10 s at `max`.
    re-reads it every 60 s, so a ZCode re-login is picked up automatically.
 2. Entitlements (`provider/updateAccountConfig`) are parsed from the desktop's
    own log, so plan changes propagate.
-3. The upstream WAF requires a per-request Aliyun captcha device token. Tokens
-   are minted headlessly for ZCode's captcha scene, pooled in `tokens.json`,
-   and refilled automatically (see `mint-captcha.js`).
+3. Captcha tokens are only sent when ZCode's own `client/configs` says the
+   upstream wants them (`configs.captcha.skip_model_request`). The flag is
+   cached for 5 minutes. When tokens *are* required they are minted headlessly
+   (`mint-captcha.js`) and pooled in `tokens.json`; if the upstream ever starts
+   rejecting requests as `3012`, the bridge flips the policy and retries once.
+   While the flag is `true` no Chromium is needed at all.
 4. The upstream WAF also requires ZCode's identity line as `system[0]` and its
    preamble as `system[1]`. The bridge prepends them (`sysblocks.json`), then
    your own system prompt follows.
@@ -152,10 +155,11 @@ curl http://127.0.0.1:3010/health    # ready + captcha pool
 | Symptom | Cause / fix |
 |---|---|
 | `zcode.cjs not found` | ZCode not installed, or set `GLM_BRIDGE_CLI` |
-| `captcha token pool exhausted` | first mint takes ~20 s; see logs, ensure Chromium is present |
+| HTTP 503 from 9router, `/health` hangs | bridge not answering — `glm-bridge status`, then `logs`; a slow first request is normal (CLI spawn) |
+| `captcha token pool exhausted` | upstream re-enabled captcha and minting failed — check Chromium, `mint-captcha.js` by hand |
+| `FAILED TO PRIME device module` in logs | mint could not reach the Aliyun SDK; harmless while `skip_model_request` is `true` |
 | HTTP 401 from upstream | ZCode session expired — open ZCode once to re-login |
-| HTTP 405 `code 3012` | WAF rejected the request; restart the bridge to refresh the captcha pool |
-| empty reply, then ok | first request after start triggers captcha minting |
+| HTTP 405 `code 3012` | the bridge retries once with a token; if it persists, check network to `zcode.z.ai` |
 
 ## Security
 

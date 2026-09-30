@@ -162,20 +162,68 @@ function ensureTokens(background = true) {
   if (!background) { /* caller may poll pool */ }
 }
 
-function captchaHeader() {
-  let tok = nextToken();
-  if (!tok) {
-    // synchronous last resort: block until one batch lands (mint takes ~20s)
-    ensureTokens();
-    const deadline = Date.now() + 90_000;
-    while (!tok && Date.now() < deadline) {
-      // sync wait that works on Windows too (no /bin/sleep there)
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 500);
-      loadTokens();
-      tok = nextToken();
-    }
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+// The upstream decides whether model requests need a captcha token at all
+// (`configs.captcha.skip_model_request`). When it is true we must not mint:
+// minting needs Chromium, can fail, and burning tokens we do not need leaves
+// the bridge refusing requests (HTTP 503 from 9router) once the pool drains.
+// The policy is cached for a few minutes and refreshed in the background.
+const CAPTCHA_CONFIG_URL = `https://zcode.z.ai/api/v1/client/configs?app_version=${encodeURIComponent(process.env.ZCODE_APP_VERSION || '3.14.4')}&platform=${IS_WIN ? 'win32-x64' : 'linux-x64'}`;
+let captchaPolicy = { at: 0, required: null };
+
+async function captchaPolicyRequired() {
+  if (captchaPolicy.required !== null && Date.now() - captchaPolicy.at < 5 * 60_000) {
+    return captchaPolicy.required;
   }
-  if (!tok) return null;
+  try {
+    const r = await fetch(CAPTCHA_CONFIG_URL, {
+      headers: { authorization: 'Bearer ' + loadJwt(), accept: 'application/json' },
+      signal: AbortSignal.timeout(8000),
+    });
+    const j = await r.json();
+    const c = j && j.data && j.data.configs && j.data.configs.captcha;
+    const required = !!(c && c.enabled !== false && c.skip_model_request !== true);
+    if (required !== captchaPolicy.required) {
+      log(`captcha policy changed -> ${required ? 'required (minting enabled)' : 'not required (skip_model_request)'}`);
+    }
+    captchaPolicy = { at: Date.now(), required };
+    return required;
+  } catch (e) {
+    if (captchaPolicy.required === null) {
+      log('captcha policy unknown, assuming not required:', e.message);
+      captchaPolicy = { at: Date.now(), required: false };
+    }
+    return captchaPolicy.required;
+  }
+}
+
+// Called when the upstream rejects a request as captcha-blocked, so we can
+// recover even if the config endpoint said otherwise.
+function forceCaptchaRequired(reason) {
+  if (captchaPolicy.required !== true) log('captcha forced required:', reason);
+  captchaPolicy = { at: Date.now(), required: true };
+  ensureTokens();
+}
+
+async function waitForToken(ms) {
+  let tok = nextToken();
+  if (tok) return tok;
+  ensureTokens();
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    await sleep(500);   // async: never blocks the HTTP server
+    loadTokens();
+    tok = nextToken();
+    if (tok) return tok;
+  }
+  return null;
+}
+
+async function captchaHeader() {
+  if (!(await captchaPolicyRequired())) return {};   // upstream does not want one
+  const tok = await waitForToken(20_000);
+  if (!tok) return null;                             // required but we have none
   const param = Buffer.from(JSON.stringify({
     captchaId: CAPTCHA.captchaId,
     sceneId: CAPTCHA.sceneId,
@@ -407,7 +455,8 @@ class ZcodeClient {
   onMessage(m) {
     // server -> client request
     if (m.method && m.id !== undefined && !this.pending.has(m.id)) {
-      this.answerServerRequest(m);
+      Promise.resolve(this.answerServerRequest(m)).catch(e =>
+        log('answerServerRequest rejected:', e.message));
       return;
     }
     // client -> server response
@@ -420,20 +469,20 @@ class ZcodeClient {
     // notifications: state.updated etc. — ignored (generateText is request/response)
   }
 
-  answerServerRequest(m) {
+  async answerServerRequest(m) {
     let result = {};
     try {
       if (m.method === 'session/requestRuntimePreferences') {
         result = { nativeSearchEnhancementsEnabled: false };
       } else if (m.method === 'interaction/requestProviderRuntimeHeaders') {
-        const hdrs = captchaHeader();
-        if (!hdrs) {
+        const hdrs = await captchaHeader();
+        if (hdrs === null) {
           result = { headersApplied: false, errorMessage: 'captcha token pool exhausted' };
-          log('captcha pool empty; refusing header request');
+          log('captcha required but pool empty; refusing header request');
         } else {
           const jwt = loadJwt();
           result = { headersApplied: true, requestAuth: { apiKey: jwt, headers: hdrs } };
-          log(`runtime headers applied (reason=${(m.params || {}).reason}, pool=${tokens.length})`);
+          log(`runtime headers applied (reason=${(m.params || {}).reason}, captcha=${Object.keys(hdrs).length ? 'token' : 'none'}, pool=${tokens.length})`);
         }
       } else {
         log('unhandled server request', m.method, JSON.stringify(m.params || {}).slice(0, 200));
@@ -513,7 +562,15 @@ class ZcodeClient {
         maxOutputTokens,
       };
       if (tools && tools.length) params.tools = tools;
-      const r = await this.send('workspace/generateText', params, 300_000);
+      const sendOnce = () => this.send('workspace/generateText', params, 300_000);
+      let r = await sendOnce();
+      // If the upstream starts demanding captcha tokens again, recover on the
+      // spot instead of failing the request: flip the policy and retry once.
+      if (r.error && /3012|unusual activity|captcha/i.test(JSON.stringify(r.error))) {
+        forceCaptchaRequired('upstream rejected the request');
+        await sleep(400);
+        r = await sendOnce();
+      }
       if (r.error) {
         const msg = JSON.stringify(r.error);
         log('generateText error:', msg.slice(0, 500));
@@ -1158,14 +1215,17 @@ function boot() {
   writePid(process.pid);
   loadTokens();
   saveTokens();
-  ensureTokens();
   getClient(); // start the ZCode CLI immediately so /health is meaningful
+  // Only mint when the upstream actually wants captcha tokens.
+  captchaPolicyRequired().then(req => { if (req) ensureTokens(); }).catch(() => {});
 
   server.listen(config.port, '127.0.0.1', () => {
     log(`glm-bridge listening on http://127.0.0.1:${config.port}/v1 (key: ${config.key})`);
   });
 
-  setInterval(() => { if (tokens.length < 8) ensureTokens(); }, 5 * 60_000);
+  setInterval(() => {
+    captchaPolicyRequired().then(req => { if (req && tokens.length < 8) ensureTokens(); }).catch(() => {});
+  }, 5 * 60_000);
 
   for (const sig of ['SIGINT', 'SIGTERM']) {
     process.on(sig, () => {
