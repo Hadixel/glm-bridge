@@ -28,7 +28,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
-const { spawn, execFileSync } = require('child_process');
+const { spawn, execFileSync, execFile } = require('child_process');
 
 // ---------------------------------------------------------------- config ----
 const HOME = os.homedir();
@@ -142,7 +142,8 @@ function ensureTokens(background = true) {
   if (!fs.existsSync(MINT_SCRIPT)) { log('mint script missing:', MINT_SCRIPT); return; }
   minting = true;
   const out = path.join(STATE_DIR, `tokens-mint-${Date.now()}.json`);
-  const p = spawn(process.execPath, [MINT_SCRIPT, '10', out], { stdio: ['ignore', 'pipe', 'pipe'] });
+  const p = spawn(process.execPath, [MINT_SCRIPT, '10', out],
+    { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, ...proxyEnv() } });
   p.stdout.on('data', d => log('[mint]', String(d).trim()));
   p.stderr.on('data', d => log('[mint:err]', String(d).trim().slice(0, 300)));
   p.on('exit', code => {
@@ -164,6 +165,87 @@ function ensureTokens(background = true) {
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
+// ------------------------------------------------------- connectivity ------
+// The local network may have no direct internet (VPN off), which made every
+// upstream call hang until the CLI gave up. We probe direct first, then fall
+// back to a local proxy, and give the result to the CLI child via env
+// (Node honours HTTPS_PROXY when --use-env-proxy is on, which we inject).
+const PROXY_CANDIDATES = (process.env.GLM_BRIDGE_PROXY !== undefined
+  ? [process.env.GLM_BRIDGE_PROXY]
+  : ['http://127.0.0.1:10809', 'http://127.0.0.1:7890', 'http://127.0.0.1:8118',
+     'http://127.0.0.1:20171', 'http://127.0.0.1:1080']
+).filter(Boolean);
+const PROBE_HOST = 'zcode.z.ai';
+const PROBE_PATH = '/api/v1/zcode-plan/billing/current?app_version=3.14.4';
+let resolvedProxy;      // undefined = unprobed, null = direct, string = proxy url
+let resolvedProxyAt = 0;
+
+// Minimal HTTPS GET that can tunnel through an http proxy (CONNECT).
+function httpsGet(path, proxy, timeoutMs = 10000, extraHeaders = {}) {
+  // curl does the CONNECT tunneling for us and is present on Linux, macOS and
+  // Windows 10+. A hand-rolled TLS tunnel was tried and hung instead of failing.
+  return new Promise(resolve => {
+    const secs = Math.max(2, Math.ceil(timeoutMs / 1000));
+    const args = ['-sS', '-m', String(secs), '-w', '\n__CODE__%{http_code}'];
+    if (proxy) args.push('-x', proxy);
+    for (const [k, v] of Object.entries(extraHeaders)) args.push('-H', `${k}: ${v}`);
+    args.push(`https://${PROBE_HOST}${path}`);
+    execFile('curl', args, { timeout: (secs + 3) * 1000, maxBuffer: 4 * 1024 * 1024 },
+      (err, stdout) => {
+        const s = String(stdout || '');
+        const i = s.lastIndexOf('\n__CODE__');
+        if (i < 0) return resolve({ status: 0, body: '' });
+        resolve({ status: Number(s.slice(i + 9)) || 0, body: s.slice(0, i) });
+      });
+  });
+}
+
+async function resolveProxy(force = false) {
+  if (!force && resolvedProxy !== undefined && Date.now() - resolvedProxyAt < 5 * 60_000) return resolvedProxy;
+  const direct = await httpsGet(PROBE_PATH, null).catch(() => ({ status: 0 }));
+  if (direct.status >= 200 && direct.status < 500) {
+    if (resolvedProxy !== null && resolvedProxy !== undefined) log('connectivity: direct route OK');
+    resolvedProxy = null;
+    resolvedProxyAt = Date.now();
+    return resolvedProxy;
+  }
+  for (const p of PROXY_CANDIDATES) {
+    const r = await httpsGet(PROBE_PATH, p).catch(() => ({ status: 0 }));
+    if (r.status >= 200 && r.status < 500) {
+      log(`connectivity: direct blocked, using proxy ${p} (upstream ${r.status})`);
+      resolvedProxy = p;
+      resolvedProxyAt = Date.now();
+      return resolvedProxy;
+    }
+  }
+  log('connectivity: no working route (direct and proxies failed)');
+  resolvedProxy = null;
+  resolvedProxyAt = Date.now();
+  return null;
+}
+
+// Env handed to the CLI child and to minting so their HTTP goes via the proxy.
+function proxyEnv() {
+  const p = resolvedProxy;
+  if (!p) return {};
+  return {
+    HTTPS_PROXY: p, HTTP_PROXY: p, https_proxy: p, http_proxy: p,
+    ALL_PROXY: p, all_proxy: p,
+    NO_PROXY: 'localhost,127.0.0.1,::1',
+    no_proxy: 'localhost,127.0.0.1,::1',
+    // Node only applies proxy env to global clients when this flag is on.
+    // NB: do not "dedupe" by testing the incoming value against the flag we
+    // are adding — that filters out the flag itself and yields an empty string.
+    NODE_OPTIONS: (() => {
+      const cur = (process.env.NODE_OPTIONS || '').trim();
+      if (cur.includes('--use-env-proxy')) return cur;
+      return cur ? `${cur} --use-env-proxy` : '--use-env-proxy';
+    })(),
+    GLM_BRIDGE_PROXY: p,
+    MINT_PROXY: p,
+  };
+}
+
 // The upstream decides whether model requests need a captcha token at all
 // (`configs.captcha.skip_model_request`). When it is true we must not mint:
 // minting needs Chromium, can fail, and burning tokens we do not need leaves
@@ -177,11 +259,11 @@ async function captchaPolicyRequired() {
     return captchaPolicy.required;
   }
   try {
-    const r = await fetch(CAPTCHA_CONFIG_URL, {
-      headers: { authorization: 'Bearer ' + loadJwt(), accept: 'application/json' },
-      signal: AbortSignal.timeout(8000),
-    });
-    const j = await r.json();
+    const url = new URL(CAPTCHA_CONFIG_URL);
+    const r = await httpsGet(url.pathname + url.search, resolvedProxy, 10000,
+      { authorization: 'Bearer ' + loadJwt() });
+    if (!r.status) throw new Error('unreachable');
+    const j = JSON.parse(r.body || '{}');
     const c = j && j.data && j.data.configs && j.data.configs.captcha;
     const required = !!(c && c.enabled !== false && c.skip_model_request !== true);
     if (required !== captchaPolicy.required) {
@@ -416,6 +498,7 @@ class ZcodeClient {
     if (!builtinFile) { log('zcode-builtin.json not found; retrying in 10s'); setTimeout(() => this.start(), 10_000); return; }
     const env = {
       ...process.env,
+      ...proxyEnv(),
       ZCODE_BUILTIN_PROVIDER_CONFIG_FILE: builtinFile,
       ZCODE_PERSONAL_PROVIDER_CONFIG_FILE: path.join(ZCODE_DIR, 'v2', 'provider_config.json'),
     };
@@ -574,6 +657,10 @@ class ZcodeClient {
       if (r.error) {
         const msg = JSON.stringify(r.error);
         log('generateText error:', msg.slice(0, 500));
+        // code 1005 = the ZCode plan itself is inactive/exhausted, not our bug
+        if (/exceed quota|1005/.test(msg)) {
+          return { error: { message: 'ZCode plan inactive or quota exhausted (upstream code 1005) — open the ZCode desktop app to check or re-claim the plan.' } };
+        }
         return { error: r.error };
       }
       let result = r.result;
@@ -1215,15 +1302,26 @@ function boot() {
   writePid(process.pid);
   loadTokens();
   saveTokens();
-  getClient(); // start the ZCode CLI immediately so /health is meaningful
-  // Only mint when the upstream actually wants captcha tokens.
-  captchaPolicyRequired().then(req => { if (req) ensureTokens(); }).catch(() => {});
 
   server.listen(config.port, '127.0.0.1', () => {
     log(`glm-bridge listening on http://127.0.0.1:${config.port}/v1 (key: ${config.key})`);
   });
 
-  setInterval(() => {
+  // Probe connectivity first: the CLI child inherits the proxy env we pick,
+  // so it must be decided before the child is spawned.
+  resolveProxy(true)
+    .then(() => getClient())
+    .then(() => captchaPolicyRequired())
+    .then(req => { if (req) ensureTokens(); })
+    .catch(e => log('bootstrap error:', e.message));
+
+  setInterval(async () => {
+    const before = resolvedProxy;
+    await resolveProxy(true);
+    if (resolvedProxy !== before && client) {
+      log(`connectivity changed (${before || 'direct'} -> ${resolvedProxy || 'direct'}), respawning CLI`);
+      try { client.child && client.child.kill('SIGHUP'); } catch { /* exit handler respawns */ }
+    }
     captchaPolicyRequired().then(req => { if (req && tokens.length < 8) ensureTokens(); }).catch(() => {});
   }, 5 * 60_000);
 

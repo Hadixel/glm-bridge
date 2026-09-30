@@ -126,6 +126,11 @@ Measured on a real request: `low` ≈ 3–5 s wall, versus ~10 s at `max`.
 4. The upstream WAF also requires ZCode's identity line as `system[0]` and its
    preamble as `system[1]`. The bridge prepends them (`sysblocks.json`), then
    your own system prompt follows.
+5. Connectivity is probed on boot (and every 5 minutes). If direct egress is
+   down — common when the VPN is off — the bridge picks a local proxy
+   (`http://127.0.0.1:10809` and friends) and hands it to the ZCode CLI child
+   via `HTTPS_PROXY` + `NODE_OPTIONS=--use-env-proxy`, respawning the child if
+   the route changes. The route in use is logged as `connectivity:`.
 
 **The ZCode desktop app does not need to stay open.** The bridge extracts its
 own copy of the ZCode CLI on first run and reuses it; the temporary AppImage
@@ -139,6 +144,7 @@ mount under `/tmp` is not required afterwards.
 | `GLM_BRIDGE_KEY` | auto | API key (persisted in `config.json`) |
 | `GLM_BRIDGE_REASONING` | `low` | default reasoning level |
 | `GLM_BRIDGE_CLI` | auto | override path to `zcode.cjs` |
+| `GLM_BRIDGE_PROXY` | auto | force a proxy (`http://host:port`), or `""` to force direct |
 | `GLM_BRIDGE_PW` | auto | path to `playwright-core` |
 | `GLM_BRIDGE_CHROMIUM` | auto | path to a Chromium binary for minting |
 | `MINT_PROXY` | none | proxy for the minting browser |
@@ -155,6 +161,8 @@ curl http://127.0.0.1:3010/health    # ready + captcha pool
 | Symptom | Cause / fix |
 |---|---|
 | `zcode.cjs not found` | ZCode not installed, or set `GLM_BRIDGE_CLI` |
+| requests hang 60 s, then `Model request was cancelled` | no route to `zcode.z.ai` — see `connectivity:` in the logs; the bridge falls back to a local proxy automatically (set `GLM_BRIDGE_PROXY` to pin one) |
+| `ZCode plan inactive or quota exhausted (1005)` | the upstream plan is gone — open the ZCode desktop app and check/re-claim it (`billing/current` returns `plans: []`) |
 | HTTP 503 from 9router, `/health` hangs | bridge not answering — `glm-bridge status`, then `logs`; a slow first request is normal (CLI spawn) |
 | `captcha token pool exhausted` | upstream re-enabled captcha and minting failed — check Chromium, `mint-captcha.js` by hand |
 | `FAILED TO PRIME device module` in logs | mint could not reach the Aliyun SDK; harmless while `skip_model_request` is `true` |
