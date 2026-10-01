@@ -34,6 +34,8 @@ glm-bridge stop       # stop, including any stale instance holding the port
 glm-bridge restart
 glm-bridge status     # running/stopped + readiness
 glm-bridge logs 100   # last N log lines
+glm-bridge claim      # claim the daily plan now (add --force to claim even
+                      #   when a plan already looks active)
 glm-bridge run        # run in foreground
 ```
 
@@ -110,6 +112,34 @@ Per-request overrides also work: OpenAI `reasoning_effort`, Anthropic
 
 Measured on a real request: `low` ≈ 3–5 s wall, versus ~10 s at `max`.
 
+## Daily plan auto-claim
+
+ZCode's **Start Plan** offer (100M tokens) is offered every day around 19:30
+and must be claimed, otherwise the upstream answers `exceed quota limit`
+(code 1005) and every completion fails.
+
+The bridge claims it for you:
+
+- **At the offer time** (default `19:30` local, `GLM_BRIDGE_CLAIM_AT`), using
+  `--force` so it claims even if the previous day's plan is still listed.
+- **Every 15 minutes** as a self-heal: if no plan is active it tries again
+  (throttled to one attempt per 10 min).
+
+Claiming needs the desktop's Aliyun captcha flow, which only runs inside a
+real browser page. `claim-plan.js` therefore replays the desktop app's exact
+`initAliyunCaptcha` setup on `zcode.z.ai` (popup mode, a real `<button>`
+trigger, `showErrorTip:false`) in headless Chromium, captures the verify param
+from `captchaVerifyCallback`, and POSTs it to
+`/api/v1/zcode-plan/billing/claim`. Minting is retried with a fresh page
+because the SDK intermittently completes without invoking the callback.
+
+Requirements: Playwright Chromium (`npm i playwright-core` plus
+`npx playwright install chromium`). Auto-claim can be turned off with
+`GLM_BRIDGE_CLAIM_DISABLE=1`.
+
+Run `glm-bridge claim` to trigger it by hand; results are logged as
+`claim: {...}` and can be seen with `glm-bridge logs`.
+
 ## How it works
 
 1. ZCode stores credentials `enc:v1:` (AES-256-GCM) with a key derived from a
@@ -145,6 +175,9 @@ mount under `/tmp` is not required afterwards.
 | `GLM_BRIDGE_REASONING` | `low` | default reasoning level |
 | `GLM_BRIDGE_CLI` | auto | override path to `zcode.cjs` |
 | `GLM_BRIDGE_PROXY` | auto | force a proxy (`http://host:port`), or `""` to force direct |
+| `GLM_BRIDGE_CLAIM_AT` | `19:30` | local time for the daily plan claim |
+| `GLM_BRIDGE_CLAIM_DISABLE` | unset | `1` disables auto-claim |
+| `GLM_BRIDGE_PLAN` | `zcode-v3-start-plan` | plan id to claim |
 | `GLM_BRIDGE_PW` | auto | path to `playwright-core` |
 | `GLM_BRIDGE_CHROMIUM` | auto | path to a Chromium binary for minting |
 | `MINT_PROXY` | none | proxy for the minting browser |

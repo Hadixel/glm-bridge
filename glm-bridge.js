@@ -1147,6 +1147,64 @@ function spawnDetached() {
 }
 
 const SERVICE_NAME = 'glm-bridge';
+
+// ------------------------------------------------------------- plan claim ----
+// The ZCode "Start Plan" offer (100M tokens) refreshes daily and must be
+// claimed, otherwise the bridge hits "exceed quota limit" (1005). Claiming
+// needs the desktop's Aliyun captcha flow, so we delegate to claim-plan.js,
+// which replays that flow in a headless browser and then POSTs the claim.
+const CLAIM_SCRIPT = path.join(ASSET_DIR, 'claim-plan.js');
+const CLAIM_AT = process.env.GLM_BRIDGE_CLAIM_AT || '19:30';
+const CLAIM_PLAN = process.env.GLM_BRIDGE_PLAN || 'zcode-v3-start-plan';
+const CLAIM_DISABLED = process.env.GLM_BRIDGE_CLAIM_DISABLE === '1';
+let claiming = false;
+let lastClaimAttempt = 0;
+
+function runClaim(force) {
+  if (claiming) return Promise.resolve({ ok: false, reason: 'claim already in flight' });
+  if (!force && Date.now() - lastClaimAttempt < 10 * 60_000) {
+    return Promise.resolve({ ok: false, reason: 'throttled' });
+  }
+  if (!fs.existsSync(CLAIM_SCRIPT)) {
+    return Promise.resolve({ ok: false, reason: 'claim-plan.js missing' });
+  }
+  claiming = true;
+  lastClaimAttempt = Date.now();
+  return new Promise(resolve => {
+    const argv = [CLAIM_SCRIPT, '--plan', CLAIM_PLAN, '--json'];
+    if (force) argv.push('--force');
+    log('claim: starting' + (force ? ' (scheduled daily run)' : ''));
+    execFile(process.execPath, argv,
+      { env: { ...process.env, ...proxyEnv() }, timeout: 12 * 60_000, maxBuffer: 4 * 1024 * 1024 },
+      (err, stdout) => {
+        claiming = false;
+        const line = String(stdout || '').trim().split('\n').filter(Boolean).pop();
+        let res = null;
+        try { res = JSON.parse(line); } catch { /* fall through */ }
+        if (!res) res = { ok: false, detail: String(stdout).slice(0, 300) || (err && err.message) || 'no output' };
+        log('claim: ' + JSON.stringify(res).slice(0, 600));
+        resolve(res);
+      });
+  });
+}
+
+function scheduleClaims() {
+  if (CLAIM_DISABLED) { log('claim: auto-claim disabled (GLM_BRIDGE_CLAIM_DISABLE=1)'); return; }
+  const parts = String(CLAIM_AT).split(':');
+  const hh = Number(parts[0]);
+  const mm = Number(parts[1]);
+  const now = new Date();
+  const next = new Date(now);
+  next.setHours(Number.isFinite(hh) ? hh : 19, Number.isFinite(mm) ? mm : 30, 0, 0);
+  if (next <= now) next.setDate(next.getDate() + 1);
+  const wait = next - now;
+  log(`claim: daily attempt at ${CLAIM_AT} (in ${Math.round(wait / 60000)} min); ` +
+      `self-heal check every 30 min while the plan is inactive`);
+  setTimeout(() => {
+    runClaim(true).finally(() => setTimeout(scheduleClaims, 5000));
+  }, wait);
+  setInterval(() => { runClaim(false).catch(() => {}); }, 30 * 60_000);
+}
 async function ctl() {
   // If something is already serving our port but the pid file is stale or
   // missing, adopt that process so status/stop act on the real owner.
@@ -1250,6 +1308,12 @@ async function ctl() {
     } else if (!alive) {
       process.exitCode = 1;
     }
+  } else if (sub === 'claim') {
+    const force = argv.includes('--force');
+    const r = await runClaim(force);
+    if (r.claimed) console.log('claimed: ' + (r.planId || CLAIM_PLAN));
+    else console.log('not claimed: ' + JSON.stringify(r).slice(0, 400));
+    if (!r.ok && !r.claimed) process.exitCode = 1;
   } else if (sub === 'logs') {
     const n = Number(argv[1] || 40);
     try {
@@ -1290,7 +1354,7 @@ async function main() {
     boot();
     return;
   }
-  if (sub === 'status' || sub === 'start' || sub === 'restart' || sub === 'stop' || sub === 'logs' || sub === 'help' || sub === '--help' || sub === '-h') {
+  if (['status','start','restart','stop','logs','claim','help','--help','-h'].includes(sub)) {
     await ctl();
     return;
   }
@@ -1314,6 +1378,8 @@ function boot() {
     .then(() => captchaPolicyRequired())
     .then(req => { if (req) ensureTokens(); })
     .catch(e => log('bootstrap error:', e.message));
+
+  scheduleClaims();
 
   setInterval(async () => {
     const before = resolvedProxy;

@@ -71,10 +71,14 @@ function findChromium() {
   for (const root of playwrightCacheRoots()) {
     let dirs = [];
     try {
-      dirs = fs.readdirSync(root)
-        .filter(d => /^chromium/.test(d))
-        .sort()
-        .reverse();
+      let all = [];
+      try { all = fs.readdirSync(root).filter(d => /^chromium/.test(d)).sort().reverse(); } catch { continue; }
+      // Prefer full Chromium: the Aliyun SDK does not complete inside
+      // chrome-headless-shell (the callback never fires).
+      const dirs = [
+        ...all.filter(d => !d.includes('headless_shell')),
+        ...all.filter(d => d.includes('headless_shell')),
+      ];
     } catch { continue; }
     for (const d of dirs) {
       for (const [dir, leaf] of rel) {
@@ -101,54 +105,74 @@ function findChromium() {
   await page.goto('https://zcode.z.ai/', { waitUntil: 'domcontentloaded', timeout: 90000 });
   await page.waitForTimeout(4000);
 
-  let primed = false;
-  for (let attempt = 0; attempt < 3 && !primed; attempt++) {
-    await page.evaluate(async ({ scene, prefix, region }) => {
-      if (!window.initAliyunCaptcha) {
-        await new Promise((res, rej) => {
-          const s = document.createElement('script');
-          s.src = 'https://o.alicdn.com/captcha-frontend/aliyunCaptcha/AliyunCaptcha.js';
-          s.onload = res; s.onerror = rej;
-          document.head.appendChild(s);
-        });
-      }
-      window.AliyunCaptchaConfig = { region, prefix };
-      let el = document.getElementById('__tokenFeeder');
-      if (!el) {
-        el = document.createElement('div');
-        el.id = '__tokenFeeder';
-        el.style.cssText = 'position:fixed;left:-9999px;width:320px;height:40px;';
-        document.body.appendChild(el);
-      }
-      window.initAliyunCaptcha({
-        SceneId: scene, mode: 'embed', element: '#__tokenFeeder',
-        region, prefix, language: 'en',
-        captchaVerifyCallback: async () => ({ captchaResult: true }),
-        onBizResultCallback: () => {},
-      });
-    }, { scene: SCENE_ID, prefix: PREFIX, region: REGION }).catch(e => log('init: ' + e.message));
-
-    for (let i = 0; i < 30 && !primed; i++) {
-      await page.waitForTimeout(1000);
-      primed = await page.evaluate(() => {
-        const um = window.z_um || window.um;
-        try { const t = um && um.getToken && um.getToken(); return typeof t === 'string' && t.length > 10; } catch { return false; }
+  // The Aliyun SDK hands the finished *verify param* to captchaVerifyCallback.
+  // That string (base64 JSON with captchaId/sceneId/securityToken) is exactly
+  // what the upstream expects in X-Aliyun-Captcha-Verify-Param. Raw
+  // window.z_um.getToken() gives a chat.z.ai web device token instead, which
+  // this scene rejects with code 3007.
+  await page.evaluate(async ({ scene, prefix, region }) => {
+    window.__zparams = [];
+    window.__zraw = [];
+    if (!window.initAliyunCaptcha) {
+      await new Promise((res, rej) => {
+        const s = document.createElement('script');
+        s.src = 'https://o.alicdn.com/captcha-frontend/aliyunCaptcha/AliyunCaptcha.js';
+        s.onload = res; s.onerror = () => rej(new Error('cdn-script-load-failed'));
+        document.head.appendChild(s);
       });
     }
+    window.AliyunCaptchaConfig = { region, prefix };
+    let el = document.getElementById('__tokenFeeder');
+    if (!el) {
+      el = document.createElement('div');
+      el.id = '__tokenFeeder';
+      el.style.cssText = 'position:fixed;left:-9999px;width:320px;height:40px;';
+      document.body.appendChild(el);
+    }
+    const capture = (arg) => {
+      const p = typeof arg === 'string' ? arg
+        : (arg && (arg.captchaVerifyParam || arg.CaptchaVerifyParam)) || null;
+      if (p && String(p).trim()) window.__zparams.push(String(p).trim());
+      else if (arg !== undefined) window.__zraw.push(JSON.stringify(arg));
+    };
+    window.initAliyunCaptcha({
+      SceneId: scene, mode: 'embed', element: '#__tokenFeeder',
+      region, prefix, language: 'en',
+      captchaVerifyCallback: async (arg) => { capture(arg); return { captchaResult: true }; },
+      onBizResultCallback: (arg) => { capture(arg); },
+    });
+  }, { scene: SCENE_ID, prefix: PREFIX, region: REGION }).catch(e => log('init: ' + e.message));
+
+  // Wait for the SDK to finish traceless verification and emit a param.
+  let params = [];
+  for (let i = 0; i < 45 && params.length === 0; i++) {
+    await page.waitForTimeout(1000);
+    params = await page.evaluate(() => [...new Set(window.__zparams || [])]);
   }
-  if (!primed) { log('FAILED TO PRIME device module'); await browser.close(); process.exit(1); }
+  log('verify params from SDK: ' + params.length +
+      (params.length === 0 ? ' (raw callbacks: ' +
+        await page.evaluate(() => (window.__zraw || []).length) + ')' : ''));
 
-  const tokens = await page.evaluate(async (per) => {
-    const out = [];
-    const um = window.z_um || window.um;
-    for (let i = 0; i < per; i++) {
-      try { out.push(await um.getToken()); } catch { await new Promise(r => setTimeout(r, 200)); }
-    }
-    return [...new Set(out)];
-  }, COUNT);
+  // Fallback: raw device tokens (kept for scenes where they are accepted).
+  if (params.length < COUNT) {
+    const tokens = await page.evaluate(async (per) => {
+      const out = [];
+      const um = window.z_um || window.um;
+      for (let i = 0; i < per; i++) {
+        try { out.push(await um.getToken()); } catch { await new Promise(r => setTimeout(r, 200)); }
+      }
+      return [...new Set(out)];
+    }, COUNT).catch(() => []);
+    params = [...params, ...tokens];
+  }
 
-  fs.writeFileSync(OUT, JSON.stringify(tokens));
-  log('minted ' + tokens.length + ' -> ' + OUT);
+  if (!params.length) {
+    log('FAILED to obtain any captcha param');
+    await browser.close();
+    process.exit(1);
+  }
+  fs.writeFileSync(OUT, JSON.stringify(params));
+  log('minted ' + params.length + ' -> ' + OUT);
   await browser.close();
-  process.exit(tokens.length ? 0 : 1);
+  process.exit(0);
 })().catch(e => { console.error('FATAL', e.message); process.exit(1); });
