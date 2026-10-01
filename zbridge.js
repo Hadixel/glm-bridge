@@ -12,7 +12,7 @@
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
-const { spawn, execFileSync } = require('child_process');
+const { spawn } = require('child_process');
 
 const BRIDGE = path.join(__dirname, 'glm-bridge.js');
 
@@ -24,19 +24,51 @@ if (argv.length) {
   tui();
 }
 
-function sh(cmd, args) {
-  try { return execFileSync(process.execPath, [BRIDGE, ...args], { encoding: 'utf8' }).trim(); }
-  catch (e) { return String(e.stdout || e.message || '').trim(); }
+// Async with a hard timeout: a wedged child (hung schtasks/fetch on Windows)
+// must never freeze the menu — blocking execFileSync did exactly that.
+function sh(args, timeoutMs = 60_000) {
+  return new Promise(res => {
+    console.log(`… ${args.join(' ')}`);
+    let out = '';
+    let done = false;
+    const finish = (code) => {
+      if (done) return; done = true;
+      clearTimeout(t);
+      const s = out.trim();
+      res(s || (code ? `(command failed, exit ${code})` : 'ok'));
+    };
+    const p = spawn(process.execPath, [BRIDGE, ...args], { stdio: ['ignore', 'pipe', 'pipe'] });
+    const t = setTimeout(() => { out += '\n[timed out — command killed]'; try { p.kill('SIGKILL'); } catch { /* gone */ }
+      finish(-1); }, timeoutMs);
+    p.stdout.on('data', d => { out += d; });
+    p.stderr.on('data', d => { out += d; });
+    p.on('error', e => { out += e.message; finish(1); });
+    p.on('exit', c => finish(c || 0));
+  });
 }
 
 async function tui() {
   const readline = require('readline');
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  // Own line queue instead of rl.question: lines typed while an `await` is in
+  // flight (health fetch, command run) are emitted with no listener attached
+  // and rl.question silently swallows them — input used to just vanish.
+  const lines = [];
+  let waiter = null;
   let closed = false;
-  rl.on('close', () => { closed = true; });
+  rl.on('line', line => {
+    if (waiter) { const w = waiter; waiter = null; w(line); }
+    else lines.push(line);
+  });
+  rl.on('close', () => {
+    closed = true;
+    if (waiter) { const w = waiter; waiter = null; w(null); }
+  });
   const ask = q => new Promise(res => {
-    if (closed) return res('q');
-    rl.question(q, ans => res(ans));
+    process.stdout.write(q);
+    if (lines.length) return res(lines.shift());
+    if (closed) return res(null);   // real EOF: no more input will ever come
+    waiter = res;
   });
 
   for (;;) {
@@ -60,17 +92,18 @@ async function tui() {
     console.log('║ 9) logs (last 30)                                 ║');
     console.log('║ a) tray   b) auto-start toggle   q) quit TUI      ║');
     console.log('╚══════════════════════════════════════════════════╝');
-    const choice = (await ask('> ')).trim().toLowerCase();
-    if (closed || choice === 'q') break;
-    else if (choice === '1') console.log(sh('start', ['start']));
-    else if (choice === '2') console.log(sh('stop', ['stop']));
-    else if (choice === '3') console.log(sh('restart', ['restart']));
-    else if (choice === '4') console.log(sh('status', ['status']));
+    const raw = await ask('> ');
+    if (raw === null || raw.trim().toLowerCase() === 'q') break;
+    const choice = raw.trim().toLowerCase();
+    if (choice === '1') { console.log(await sh(['start'])); await pause(ask); }
+    else if (choice === '2') { console.log(await sh(['stop'])); await pause(ask); }
+    else if (choice === '3') { console.log(await sh(['restart'])); await pause(ask); }
+    else if (choice === '4') { console.log(await sh(['status'])); await pause(ask); }
     else if (choice === '5') {
-      console.log(sh('accounts', ['accounts']));
+      console.log(await sh(['accounts']));
       const n = (await ask('use account (name, empty=skip): ')).trim();
-      if (n) console.log(sh('use', ['use', n]));
-      await pause(rl, ask);
+      if (n) console.log(await sh(['use', n]));
+      await pause(ask);
     } else if (choice === '6') {
       const n = (await ask('account name (empty = active): ')).trim();
       // login streams to this terminal: the OAuth URL must be visible
@@ -78,25 +111,26 @@ async function tui() {
         const p = spawn(process.execPath, [BRIDGE, 'login', ...(n ? [n] : [])], { stdio: 'inherit' });
         p.on('exit', res);
       });
-      await pause(rl, ask);
+      await pause(ask);
     } else if (choice === '7') {
-      console.log(sh('accounts', ['accounts']));
+      console.log(await sh(['accounts']));
       const n = (await ask('logout which account (name, empty = active): ')).trim();
-      console.log(sh('logout', ['logout', ...(n ? [n] : [])]));
-      await pause(rl, ask);
+      console.log(await sh(['logout', ...(n ? [n] : [])]));
+      await pause(ask);
     } else if (choice === '8') {
-      console.log(sh('claim', ['claim']));
-      await pause(rl, ask);
+      // minting a captcha can take minutes on first try
+      console.log(await sh(['claim'], 15 * 60_000));
+      await pause(ask);
     } else if (choice === '9') {
-      console.log(sh('logs', ['logs', '30']));
-      await pause(rl, ask);
-    } else if (choice === 'a') { console.log(sh('tray', ['tray'])); await pause(rl, ask); }
-    else if (choice === 'b') { console.log('auto-start: ' + sh('toggle', ['autostart-toggle'])); await pause(rl, ask); }
+      console.log(await sh(['logs', '30']));
+      await pause(ask);
+    } else if (choice === 'a') { console.log(await sh(['tray'])); await pause(ask); }
+    else if (choice === 'b') { console.log('auto-start: ' + await sh(['autostart-toggle'])); await pause(ask); }
   }
   rl.close();
 }
 
-async function pause(rl, ask) { await ask('press enter…'); }
+async function pause(ask) { await ask('press enter…'); }
 
 async function fetchHealth() {
   let port = 3010;

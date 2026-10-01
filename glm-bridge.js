@@ -1204,10 +1204,9 @@ const sub = (argv[0] || 'run').toLowerCase();
 function isAlive(pid) {
   try {
     if (IS_WIN) {
-      execFileSync('tasklist', ['/FI', `PID eq ${pid}`, '/FO', 'CSV', '/NH'], { stdio: 'pipe' }).toString();
-      // tasklist prints the row if alive
-      return execFileSync('tasklist', ['/FI', `PID eq ${pid}`, '/FO', 'CSV', '/NH'], { stdio: 'pipe' })
-        .toString().split(/\r?\n/)[0].startsWith('"');
+      const txt = execFileSync('tasklist', ['/FI', `PID eq ${pid}`, '/FO', 'CSV', '/NH'],
+        { stdio: 'pipe', timeout: 10_000 }).toString();
+      return txt.split(/\r?\n/)[0].startsWith('"');
     }
     process.kill(pid, 0);
     return true;
@@ -1227,7 +1226,7 @@ function portHolders() {
   const add = pid => { if (pid && !mine.has(pid)) out.push(pid); };
   try {
     if (IS_WIN) {
-      const txt = execFileSync('netstat', ['-ano'], { stdio: 'pipe' }).toString();
+      const txt = execFileSync('netstat', ['-ano'], { stdio: 'pipe', timeout: 20_000, maxBuffer: 8 * 1024 * 1024 }).toString();
       for (const line of txt.split(/\r?\n/)) {
         if (new RegExp(`[:.]${config.port}\\s`).test(line) && /LISTENING/i.test(line)) {
           add(Number(line.trim().split(/\s+/).pop()));
@@ -1237,17 +1236,17 @@ function portHolders() {
       for (const bin of ['ss', 'lsof', 'fuser']) {
         try {
           if (bin === 'ss') {
-            const txt = execFileSync('ss', ['-ltnpH'], { stdio: 'pipe' }).toString();
+            const txt = execFileSync('ss', ['-ltnpH'], { stdio: 'pipe', timeout: 10_000 }).toString();
             for (const line of txt.split(/\n/)) {
               if (line.includes(`:${config.port} `)) {
                 for (const m of line.matchAll(/pid=(\d+)/g)) add(Number(m[1]));
               }
             }
           } else if (bin === 'lsof') {
-            const txt = execFileSync('lsof', ['-ti', `tcp:${config.port}`, '-sTCP:LISTEN'], { stdio: 'pipe' }).toString();
+            const txt = execFileSync('lsof', ['-ti', `tcp:${config.port}`, '-sTCP:LISTEN'], { stdio: 'pipe', timeout: 10_000 }).toString();
             for (const l of txt.split(/\n/)) if (l.trim()) add(Number(l.trim()));
           } else {
-            const txt = execFileSync('fuser', [`${config.port}/tcp`], { stdio: 'pipe' }).toString();
+            const txt = execFileSync('fuser', [`${config.port}/tcp`], { stdio: 'pipe', timeout: 10_000 }).toString();
             for (const l of txt.split(/\s+/)) if (l) add(Number(l));
           }
           if (out.length) break;
@@ -1373,7 +1372,11 @@ function setAutostart(on) {
 function killTray() {
   try {
     const t = Number(fs.readFileSync(TRAY_PID_PATH, 'utf8').trim());
-    if (t) { try { process.kill(t, 'SIGTERM'); } catch { /* already gone */ } }
+    if (t) {
+      // tray.sh is spawned detached (its own process group): kill the group so
+      // the yad child dies too, otherwise systemd's cgroup stop times out.
+      try { process.kill(-t, 'SIGTERM'); } catch { process.kill(t, 'SIGTERM'); }
+    }
   } catch { /* no tray */ }
   fs.rmSync(TRAY_PID_PATH, { force: true });
 }
@@ -1480,32 +1483,33 @@ async function ctl() {
   const service = (() => {
     if (IS_WIN) {
       try {
-        execFileSync('schtasks', ['/Query', '/TN', SERVICE_NAME], { stdio: 'pipe' });
+        execFileSync('schtasks', ['/Query', '/TN', SERVICE_NAME], { stdio: 'pipe', timeout: 15_000 });
         return { kind: 'schtasks', name: SERVICE_NAME };
       } catch { return null; }
     }
     try {
-      execFileSync('systemctl', ['--user', 'cat', SERVICE_NAME + '.service'], { stdio: 'pipe' });
+      execFileSync('systemctl', ['--user', 'cat', SERVICE_NAME + '.service'], { stdio: 'pipe', timeout: 15_000 });
       return { kind: 'systemd', name: SERVICE_NAME };
     } catch { return null; }
   })();
   const svc = (action) => {
     try {
       if (service.kind === 'systemd') {
-        execFileSync('systemctl', ['--user', action, service.name], { stdio: 'pipe' });
+        execFileSync('systemctl', ['--user', action, service.name], { stdio: 'pipe', timeout: 30_000 });
       } else if (action === 'start') {
-        execFileSync('schtasks', ['/Run', '/TN', service.name], { stdio: 'pipe' });
+        execFileSync('schtasks', ['/Run', '/TN', service.name], { stdio: 'pipe', timeout: 30_000 });
       } else {
-        execFileSync('schtasks', ['/End', '/TN', service.name], { stdio: 'pipe' });
+        execFileSync('schtasks', ['/End', '/TN', service.name], { stdio: 'pipe', timeout: 30_000 });
       }
-    } catch { /* fall through to direct control */ }
+      return true;
+    } catch { return false; }
   };
   const svcState = () => {
     try {
       if (service.kind === 'systemd') {
-        return execFileSync('systemctl', ['--user', 'is-active', service.name], { stdio: 'pipe' }).toString().trim();
+        return execFileSync('systemctl', ['--user', 'is-active', service.name], { stdio: 'pipe', timeout: 15_000 }).toString().trim();
       }
-      execFileSync('schtasks', ['/Query', '/TN', service.name], { stdio: 'pipe' });
+      execFileSync('schtasks', ['/Query', '/TN', service.name], { stdio: 'pipe', timeout: 15_000 });
       return 'running';
     } catch { return 'inactive'; }
   };
@@ -1551,7 +1555,13 @@ async function ctl() {
     try { console.log(fs.readFileSync(LOG_PATH, 'utf8').split('\n').filter(Boolean).slice(-6).join('\n')); } catch {}
     process.exitCode = 1;
   } else if (sub === 'stop') {
-    if (service) { svc('stop'); } else { stop(); }
+    if (service) {
+      console.log(`stopping via ${service.kind}...`);
+      svc('stop');
+      await new Promise(r => setTimeout(r, 800));
+      if (await health()) { console.log('service stop did not take; killing directly...'); stop(); }
+      else console.log('stopped');
+    } else { stop(); }
   } else if (sub === 'status') {
     const up = await health();
     if (up && !alive) { const adopted = adoptPortHolder(); if (adopted) { pid = adopted; alive = true; } }
@@ -1559,7 +1569,7 @@ async function ctl() {
     console.log(up ? `running (pid ${pid || 'unknown'}, ${via})` : `stopped (${via})`);
     if (up) {
       try {
-        const h = await (await fetch(`http://127.0.0.1:${config.port}/health`)).json();
+        const h = await (await fetch(`http://127.0.0.1:${config.port}/health`, { signal: AbortSignal.timeout(3000) })).json();
         console.log(JSON.stringify(h));
       } catch { console.log('health: unreachable'); }
     } else if (!alive) {
@@ -1709,6 +1719,9 @@ function boot() {
   for (const sig of ['SIGINT', 'SIGTERM']) {
     process.on(sig, () => {
       log('shutting down');
+      // Kill the tray helper too: it lives in this cgroup, and systemd would
+      // otherwise wait for it, time out and mark the unit failed on every stop.
+      try { killTray(); } catch { /* ignore */ }
       try { if (client) { getClient().child && client.child.kill('SIGTERM'); } } catch { /* ignore */ }
       try { fs.rmSync(PID_PATH, { force: true }); } catch {}
       server.close(() => process.exit(0));

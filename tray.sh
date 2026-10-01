@@ -34,7 +34,8 @@ if [ -z "$GLM" ]; then GLM=$(command -v glm-bridge 2>/dev/null || true); fi
 if [ -z "$GLM" ] && [ -f "$STATE_DIR/glm-bridge.sh" ]; then GLM="sh $STATE_DIR/glm-bridge.sh"; fi
 if [ -z "$GLM" ]; then log "glm-bridge CLI not found; tray skipped"; exit 0; fi
 
-trap 'rm -f "$PID_FILE"; log "tray exit"' EXIT INT TERM
+trap 'trap - INT TERM; [ -n "${YAD_PID:-}" ] && kill "$YAD_PID" 2>/dev/null; rm -f "$PID_FILE"; log "tray exit"; exit 0' INT TERM
+trap 'rm -f "$PID_FILE"' EXIT
 echo $$ >"$PID_FILE"
 log "tray start (pid $$)"
 
@@ -47,13 +48,15 @@ while :; do
   # yad runs each command through sh -c, so $PPID there is yad's pid: killing
   # yad ends the foreground call below and the loop re-renders with fresh state.
   # yad exits non-zero when killed that way — that is the normal path, hence
-  # no `|| break`; only repeated instant failures (bad display etc.) stop us.
+  # no break on error; only repeated instant failures (bad display) stop us.
   start=$(date +%s)
   yad --notification \
       --image="$ICON" \
       --text="GLM Bridge" \
       --menu="$label!$GLM autostart-toggle && kill \$PPID|Quit!$GLM quit" \
-      || true
+      &
+  YAD_PID=$!
+  wait "$YAD_PID" || true
   now=$(date +%s)
   if [ $((now - start)) -lt 2 ]; then
     fast_fails=$((fast_fails + 1))
