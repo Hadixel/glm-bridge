@@ -45,10 +45,51 @@ const TOKENS_PATH = path.join(STATE_DIR, 'tokens.json');
 const CACHE_PATH = path.join(STATE_DIR, 'account-revision.json');
 const PID_PATH = path.join(STATE_DIR, 'bridge.pid');
 const LOG_PATH = path.join(STATE_DIR, 'bridge.log');
-// ZCode keeps its CLI data in ~/.zcode on Linux, macOS and Windows alike
-const ZCODE_DIR = path.join(HOME, '.zcode');
-const CRED_PATH = path.join(ZCODE_DIR, 'v2', 'credentials.json');
-const WORKSPACE = path.join(ZCODE_DIR, 'workspace', 'default');
+const TRAY_PID_PATH = path.join(STATE_DIR, 'tray.pid');
+const ACCOUNTS_PATH = path.join(STATE_DIR, 'accounts.json');
+// Each ZCode account is a ZCODE_DATA_BASE_DIR; the CLI resolves credentials at
+// <dir>/.zcode/v2/credentials.json. The first account ("main") uses $HOME, so
+// existing single-account installs keep working unchanged. Multiple accounts
+// each carry their own 100M/day start plan — the bridge rotates on quota.
+function loadAccounts() {
+  let a = null;
+  try { a = JSON.parse(fs.readFileSync(ACCOUNTS_PATH, 'utf8')); } catch { /* first run */ }
+  if (!a || !Array.isArray(a.accounts) || !a.accounts.length) {
+    a = { active: 'main', accounts: [{ name: 'main', dir: HOME, addedAt: Date.now() }] };
+  }
+  if (!a.accounts.some(x => x.name === a.active)) a.active = a.accounts[0].name;
+  return a;
+}
+function saveAccounts(a) { fs.writeFileSync(ACCOUNTS_PATH, JSON.stringify(a, null, 2)); }
+function activeAccount() {
+  const a = loadAccounts();
+  return a.accounts.find(x => x.name === a.active) || a.accounts[0];
+}
+function accountCredFile(acc) { return path.join(acc.dir, '.zcode', 'v2', 'credentials.json'); }
+// Called when the upstream reports quota exhausted (1005): park the active
+// account for 24 h and move to another logged-in account, so each account's
+// own 100M/day plan gets used in turn. Returns true when a live child is now
+// bound to a different account (caller retries its request once).
+function rotateAccount(reason) {
+  const a = loadAccounts();
+  const cur = a.accounts.find(x => x.name === a.active);
+  if (!cur) return false;
+  cur.exhaustedUntil = Date.now() + 24 * 3600_000;
+  const next = a.accounts.find(x =>
+    x.name !== cur.name && fs.existsSync(accountCredFile(x)) &&
+    !(x.exhaustedUntil && x.exhaustedUntil > Date.now()));
+  if (!next) { saveAccounts(a); log(`quota exhausted (${reason}) and no other account is usable`); return false; }
+  a.active = next.name;
+  saveAccounts(a);
+  credCache = { at: 0, jwt: null };  // pick up the new account's JWT immediately
+  log(`rotated to account "${next.name}" (${reason}); "${cur.name}" paused until quota resets`);
+  if (client) { try { client.child && client.child.kill('SIGHUP'); } catch { /* exit handler respawns */ } }
+  return true;
+}
+// ZCode keeps its CLI data in <dataBaseDir>/.zcode on every platform
+const zcodeDir = () => path.join(activeAccount().dir, '.zcode');
+const credPath = () => path.join(zcodeDir(), 'v2', 'credentials.json');
+const workspace = () => path.join(zcodeDir(), 'workspace', 'default');
 const MINT_SCRIPT = path.join(ASSET_DIR, 'mint-captcha.js');
 const SYSBLOCKS_PATH = path.join(ASSET_DIR, 'sysblocks.json');
 const APPIMAGE = (() => {
@@ -113,7 +154,7 @@ function decryptCredential(blob) {
 let credCache = { at: 0, jwt: null };
 function loadJwt() {
   if (Date.now() - credCache.at < 60_000 && credCache.jwt) return credCache.jwt;
-  const raw = JSON.parse(fs.readFileSync(CRED_PATH, 'utf8'));
+  const raw = JSON.parse(fs.readFileSync(credPath(), 'utf8'));
   const jwt = decryptCredential(raw['zcodejwttoken']);
   credCache = { at: Date.now(), jwt };
   return jwt;
@@ -317,7 +358,7 @@ async function captchaHeader() {
 
 // ------------------------------------------------------ builtin + revision ---
 function findBuiltinFile() {
-  const roots = [path.join(ZCODE_DIR, 'v2', 'runtime', 'provider')];
+  const roots = [path.join(zcodeDir(), 'v2', 'runtime', 'provider')];
   const hits = [];
   for (const root of roots) {
     try {
@@ -380,7 +421,7 @@ function loadAccountRevision(builtinFile) {
   const computed = builtinRevisionFor(builtinFile);
   // 1) newest desktop log line (desktop host is the source of truth)
   try {
-    const logDir = path.join(ZCODE_DIR, 'v2', 'logs');
+    const logDir = path.join(zcodeDir(), 'v2', 'logs');
     const files = fs.readdirSync(logDir).filter(f => f.endsWith('.log')).sort().reverse();
     for (const f of files) {
       const txt = fs.readFileSync(path.join(logDir, f), 'utf8');
@@ -503,17 +544,21 @@ class ZcodeClient {
       return;
     }
     this.waitReason = null;
+    const acc = activeAccount();
     const env = {
       ...process.env,
       ...proxyEnv(),
+      // Per-account data root: the child resolves <dir>/.zcode/... itself.
+      ZCODE_DATA_BASE_DIR: acc.dir,
       ZCODE_BUILTIN_PROVIDER_CONFIG_FILE: builtinFile,
-      ZCODE_PERSONAL_PROVIDER_CONFIG_FILE: path.join(ZCODE_DIR, 'v2', 'provider_config.json'),
+      ZCODE_PERSONAL_PROVIDER_CONFIG_FILE: path.join(zcodeDir(), 'v2', 'provider_config.json'),
     };
-    log('spawning CLI:', cli, '| builtin:', builtinFile);
+    try { fs.mkdirSync(workspace(), { recursive: true }); } catch { /* cwd below may exist */ }
+    log('spawning CLI:', cli, '| builtin:', builtinFile, '| account:', acc.name);
     this.lastStderr = null;
     this.waitReason = 'spawning CLI';
     this.child = spawn(process.execPath, [cli, 'app-server', '--stdio', '--surface', 'terminal'], {
-      cwd: WORKSPACE, env, stdio: ['pipe', 'pipe', 'pipe'],
+      cwd: workspace(), env, stdio: ['pipe', 'pipe', 'pipe'],
     });
     this.builtinFile = builtinFile;
     this.ready = false;
@@ -647,7 +692,7 @@ class ZcodeClient {
         if (!this.ready) return { error: { message: 'bridge warming up, retry shortly' } };
       }
       const params = {
-        workspace: { workspacePath: WORKSPACE, workspaceKey: WORKSPACE },
+        workspace: { workspacePath: workspace(), workspaceKey: workspace() },
         selection: {
           providerId: 'account:zai-start-plan',
           modelId: modelId || 'GLM-5.3-Flash',
@@ -684,11 +729,28 @@ class ZcodeClient {
       if (r.error) {
         const msg = JSON.stringify(r.error);
         log('generateText error:', msg.slice(0, 500));
-        // code 1005 = the ZCode plan itself is inactive/exhausted, not our bug
+        // code 1005 = this account's plan is exhausted (or inactive). Park it
+        // and retry once on the next logged-in account, if any.
         if (/exceed quota|1005/.test(msg)) {
-          return { error: { message: 'ZCode plan inactive or quota exhausted (upstream code 1005) — open the ZCode desktop app to check or re-claim the plan.' } };
+          if (rotateAccount('1005 on ' + (activeAccount().name))) {
+            // wait for the old child to exit (ready -> false) and the new one
+            // to finish syncing (ready -> true)
+            for (let i = 0; i < 20 && this.ready; i++) await sleep(500);
+            for (let i = 0; i < 60 && !this.ready; i++) await sleep(500);
+            if (this.ready) {
+              log('retrying request on rotated account');
+              r = await sendOnce();
+              if (!r.error) { /* fall through to result handling below */ }
+            }
+          }
         }
-        return { error: r.error };
+        if (r.error) {
+          const m2 = JSON.stringify(r.error);
+          if (/exceed quota|1005/.test(m2)) {
+            return { error: { message: 'All ZCode accounts exhausted or plan inactive (upstream code 1005) — run `zbridge` to check accounts/claims.' } };
+          }
+          return { error: r.error };
+        }
       }
       let result = r.result;
       // Thinking can swallow a small output budget: retry once with a bigger cap.
@@ -1091,6 +1153,8 @@ const server = http.createServer(async (req, res) => {
         captchaPool: tokens.length,
         cliRunning,
         credentials: jwtOk,
+        account: activeAccount().name,
+        accounts: loadAccounts().accounts.length,
         detail: !cliRunning ? (client.waitReason || 'CLI not running')
           : !jwtOk ? 'CLI running but ZCode credentials missing'
           : client.ready ? null : (client.waitReason || 'CLI up, syncing account config'),
@@ -1099,11 +1163,10 @@ const server = http.createServer(async (req, res) => {
     if (!checkAuth(req)) return sendJson(res, 401, { error: { message: 'invalid api key', type: 'invalid_request_error' } });
 
     if (req.method === 'GET' && url.pathname === '/v1/models') {
+      // One canonical id only: the start plan serves GLM-5.3-Flash, and
+      // 9router imported both casings before as "2 glm5.3 flash".
       return sendJson(res, 200, { object: 'list', data: [
-        { id: 'glm-5.3', object: 'model', owned_by: 'zcode-start-plan', created: created_ts },
         { id: 'glm-5.3-flash', object: 'model', owned_by: 'zcode-start-plan', created: created_ts },
-        { id: 'glm-5.2', object: 'model', owned_by: 'zcode-start-plan', created: created_ts },
-        { id: 'glm-5-turbo', object: 'model', owned_by: 'zcode-start-plan', created: created_ts },
       ] });
     }
     if (req.method === 'POST' && url.pathname === '/v1/chat/completions') {
@@ -1230,22 +1293,34 @@ function runClaim(force) {
   }
   claiming = true;
   lastClaimAttempt = Date.now();
-  return new Promise(resolve => {
+  const targets = loadAccounts().accounts.filter(a => fs.existsSync(accountCredFile(a)));
+  if (!targets.length) {
+    claiming = false;
+    return Promise.resolve({ ok: false, reason: 'no logged-in accounts' });
+  }
+  const claimOne = (acc) => new Promise(resolve => {
     const argv = [CLAIM_SCRIPT, '--plan', CLAIM_PLAN, '--json'];
     if (force) argv.push('--force');
-    log('claim: starting' + (force ? ' (scheduled daily run)' : ''));
+    log(`claim: starting for account "${acc.name}"` + (force ? ' (scheduled daily run)' : ''));
     execFile(process.execPath, argv,
-      { env: { ...process.env, ...proxyEnv() }, timeout: 12 * 60_000, maxBuffer: 4 * 1024 * 1024 },
+      { env: { ...process.env, ...proxyEnv(), ZCODE_CREDENTIALS: accountCredFile(acc) },
+        timeout: 12 * 60_000, maxBuffer: 4 * 1024 * 1024 },
       (err, stdout) => {
-        claiming = false;
         const line = String(stdout || '').trim().split('\n').filter(Boolean).pop();
         let res = null;
         try { res = JSON.parse(line); } catch { /* fall through */ }
         if (!res) res = { ok: false, detail: String(stdout).slice(0, 300) || (err && err.message) || 'no output' };
-        log('claim: ' + JSON.stringify(res).slice(0, 600));
-        resolve(res);
+        log(`claim[${acc.name}]: ` + JSON.stringify(res).slice(0, 600));
+        resolve({ account: acc.name, ...res });
       });
   });
+  return (async () => {
+    const results = [];
+    for (const acc of targets) results.push(await claimOne(acc));
+    claiming = false;
+    const okAll = results.every(r => r.ok || r.claimed);
+    return { ok: okAll, results };
+  })();
 }
 
 function scheduleClaims() {
@@ -1265,6 +1340,128 @@ function scheduleClaims() {
   }, wait);
   setInterval(() => { runClaim(false).catch(() => {}); }, 30 * 60_000);
 }
+// ------------------------------------------------------- autostart / tray ---
+function autostartOn() {
+  if (IS_WIN) {
+    try { execFileSync('schtasks', ['/Query', '/TN', SERVICE_NAME], { stdio: 'pipe' }); return true; } catch { return false; }
+  }
+  // systemd user unit if installed, else the XDG autostart entry
+  try { execFileSync('systemctl', ['--user', 'is-enabled', SERVICE_NAME + '.service'], { stdio: 'pipe' }); return true; }
+  catch (e) { if (String(e.stdout || '').trim() === 'enabled') return true; }
+  return fs.existsSync(path.join(HOME, '.config', 'autostart', SERVICE_NAME + '.desktop'));
+}
+function setAutostart(on) {
+  if (IS_WIN) {
+    try {
+      if (on) execFileSync('schtasks', ['/Change', '/TN', SERVICE_NAME, '/ENABLE'], { stdio: 'pipe' });
+      else execFileSync('schtasks', ['/Change', '/TN', SERVICE_NAME, '/DISABLE'], { stdio: 'pipe' });
+    } catch (e) { console.error('autostart change failed:', e.message); }
+    return;
+  }
+  const unit = path.join(HOME, '.config', 'systemd', 'user', SERVICE_NAME + '.service');
+  const desktop = path.join(HOME, '.config', 'autostart', SERVICE_NAME + '.desktop');
+  if (fs.existsSync(unit)) {
+    try { execFileSync('systemctl', ['--user', on ? 'enable' : 'disable', SERVICE_NAME + '.service'], { stdio: 'pipe' }); }
+    catch (e) { console.error('systemctl failed:', e.message); }
+    return;
+  }
+  if (on) {
+    fs.mkdirSync(path.dirname(desktop), { recursive: true });
+    fs.writeFileSync(desktop, `[Desktop Entry]\nType=Application\nName=GLM bridge\nExec="${process.execPath}" "${ASSET_DIR}/glm-bridge.js" run\nTerminal=false\nX-GNOME-Autostart-enabled=true\n`);
+  } else { fs.rmSync(desktop, { force: true }); }
+}
+function killTray() {
+  try {
+    const t = Number(fs.readFileSync(TRAY_PID_PATH, 'utf8').trim());
+    if (t) { try { process.kill(t, 'SIGTERM'); } catch { /* already gone */ } }
+  } catch { /* no tray */ }
+  fs.rmSync(TRAY_PID_PATH, { force: true });
+}
+function startTray() {
+  if (IS_WIN) {
+    const ps1 = path.join(ASSET_DIR, 'tray.ps1');
+    if (!fs.existsSync(ps1)) { console.error('tray.ps1 missing'); process.exitCode = 1; return; }
+    spawn('powershell', ['-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', ps1],
+      { stdio: 'ignore', detached: true }).unref();
+    console.log('tray started');
+    return;
+  }
+  const sh = path.join(ASSET_DIR, 'tray.sh');
+  if (!fs.existsSync(sh)) { console.error('tray.sh missing'); process.exitCode = 1; return; }
+  spawn('sh', [sh], { stdio: 'ignore', detached: true, env: { ...process.env, GLM_BRIDGE_HOME: STATE_DIR } }).unref();
+  console.log('tray started');
+}
+
+// ------------------------------------------------------ account commands ----
+async function cliLogin(name) {
+  const cli = resolveCliRoot();
+  if (!cli) { console.error('zcode.cjs not found — install ZCode first (or set GLM_BRIDGE_CLI)'); process.exitCode = 1; return; }
+  const builtin = findBuiltinFile();
+  const accs = loadAccounts();
+  let acc = name ? accs.accounts.find(a => a.name === name) : null;
+  if (name && !acc) {
+    // new account: its own data base dir under STATE_DIR/accounts/<name>
+    const dir = path.join(STATE_DIR, 'accounts', name);
+    fs.mkdirSync(dir, { recursive: true });
+    acc = { name, dir, addedAt: Date.now() };
+    accs.accounts.push(acc);
+    saveAccounts(accs);
+    console.log(`created account "${name}" -> ${dir}`);
+  }
+  if (!acc) acc = activeAccount();
+  const env = {
+    ...process.env, ...proxyEnv(),
+    ZCODE_DATA_BASE_DIR: acc.dir,
+    ZCODE_PERSONAL_PROVIDER_CONFIG_FILE: path.join(acc.dir, '.zcode', 'v2', 'provider_config.json'),
+  };
+  if (builtin) env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE = builtin;
+  console.log(`logging in account "${acc.name}" — open the printed URL in a browser (no ZCode GUI needed)`);
+  await new Promise(resolve => {
+    const p = spawn(process.execPath, [cli, 'login', '--no-browser'], { env, stdio: 'inherit' });
+    p.on('exit', code => { process.exitCode = code === 0 ? 0 : 1; resolve(); });
+  });
+  if (fs.existsSync(accountCredFile(acc))) {
+    console.log(`login OK for "${acc.name}"`);
+    if (accs.active !== acc.name && name) console.log(`switch with: glm-bridge use ${name}`);
+  } else {
+    console.log('credentials not written — login may have failed or been cancelled');
+    process.exitCode = 1;
+  }
+}
+function cliLogout(name) {
+  const accs = loadAccounts();
+  const acc = name ? accs.accounts.find(a => a.name === name) : activeAccount();
+  if (!acc) { console.error(`account "${name}" not found`); process.exitCode = 1; return; }
+  fs.rmSync(accountCredFile(acc), { force: true });
+  if (acc.name === 'main') {
+    // also ask the CLI to clear shared state it may hold for $HOME
+    try {
+      const cli = resolveCliRoot();
+      if (cli) execFileSync(process.execPath, [cli, 'logout'], { stdio: 'pipe', timeout: 30_000, env: { ...process.env, ZCODE_DATA_BASE_DIR: acc.dir } });
+    } catch { /* best effort */ }
+  }
+  console.log(`logged out "${acc.name}"`);
+}
+function listAccounts() {
+  const a = loadAccounts();
+  for (const x of a.accounts) {
+    const loggedIn = fs.existsSync(accountCredFile(x));
+    const exhausted = x.exhaustedUntil && x.exhaustedUntil > Date.now();
+    console.log(`${x.name === a.active ? '*' : ' '} ${x.name}\t${loggedIn ? 'logged-in' : 'no-credentials'}` +
+      `${exhausted ? '\texhausted-until ' + new Date(x.exhaustedUntil).toISOString() : ''}\t${x.dir}`);
+  }
+}
+function useAccount(name) {
+  if (!name) { console.error('usage: glm-bridge use <name>'); process.exitCode = 1; return; }
+  const a = loadAccounts();
+  const acc = a.accounts.find(x => x.name === name);
+  if (!acc) { console.error(`account "${name}" not found (see: glm-bridge accounts)`); process.exitCode = 1; return; }
+  if (!fs.existsSync(accountCredFile(acc))) console.warn(`warn: "${name}" has no credentials — run: glm-bridge login ${name}`);
+  a.active = name; saveAccounts(a);
+  credCache = { at: 0, jwt: null };
+  console.log(`active account: ${name}`);
+}
+
 async function ctl() {
   // If something is already serving our port but the pid file is stale or
   // missing, adopt that process so status/stop act on the real owner.
@@ -1371,9 +1568,36 @@ async function ctl() {
   } else if (sub === 'claim') {
     const force = argv.includes('--force');
     const r = await runClaim(force);
-    if (r.claimed) console.log('claimed: ' + (r.planId || CLAIM_PLAN));
-    else console.log('not claimed: ' + JSON.stringify(r).slice(0, 400));
-    if (!r.ok && !r.claimed) process.exitCode = 1;
+    if (r.results) {
+      for (const x of r.results) {
+        console.log(`${x.account}: ${x.claimed ? 'claimed' : (x.ok ? (x.reason || 'ok') : 'FAILED ' + (x.detail || ''))}`);
+      }
+      if (!r.ok) process.exitCode = 1;
+    } else if (r.claimed) console.log('claimed: ' + (r.planId || CLAIM_PLAN));
+    else {
+      console.log('not claimed: ' + JSON.stringify(r).slice(0, 400));
+      if (!r.ok) process.exitCode = 1;
+    }
+  } else if (sub === 'autostart') {
+    console.log(autostartOn() ? 'on' : 'off');
+  } else if (sub === 'autostart-toggle') {
+    const now = autostartOn();
+    setAutostart(!now);
+    console.log(autostartOn() ? 'on' : 'off');
+  } else if (sub === 'quit') {
+    // Full stop: tray, service/process — the "Quit" tray item.
+    killTray();
+    if (service) { svc('stop'); stop(); } else { stop(); }
+  } else if (sub === 'tray') {
+    startTray();
+  } else if (sub === 'login') {
+    await cliLogin(argv[1]);
+  } else if (sub === 'logout') {
+    cliLogout(argv[1]);
+  } else if (sub === 'accounts') {
+    listAccounts();
+  } else if (sub === 'use') {
+    useAccount(argv[1]);
   } else if (sub === 'logs') {
     const n = Number(argv[1] || 40);
     try {
@@ -1383,7 +1607,7 @@ async function ctl() {
   } else if (sub === 'run') {
     // handled in main()
   } else if (sub === 'help' || sub === '--help' || sub === '-h') {
-    console.log('usage: glm-bridge [start|stop|restart|status|logs [n]|run]');
+    console.log('usage: glm-bridge [start|stop|restart|status|logs [n]|run|claim [--force]|quit|tray|autostart|autostart-toggle|login [name]|logout [name]|accounts|use <name>]');
   } else {
     console.error(`unknown command: ${sub}`);
     process.exitCode = 1;
@@ -1414,8 +1638,16 @@ async function main() {
     boot();
     return;
   }
-  if (['status','start','restart','stop','logs','claim','help','--help','-h'].includes(sub)) {
+  if (['status','start','restart','stop','logs','claim','help','--help','-h',
+       'quit','tray','autostart','autostart-toggle','login','logout','accounts','use'].includes(sub)) {
     await ctl();
+    return;
+  }
+  if (sub === 'tui') {
+    const tui = path.join(ASSET_DIR, 'zbridge.js');
+    if (!fs.existsSync(tui)) { console.error('zbridge.js missing'); process.exitCode = 1; return; }
+    spawn(process.execPath, [tui], { stdio: 'inherit', env: { ...process.env, GLM_BRIDGE_HOME: STATE_DIR } })
+      .on('exit', c => { process.exitCode = c || 0; });
     return;
   }
   console.error(`unknown command: ${sub}`);
@@ -1442,6 +1674,27 @@ function boot() {
     .catch(e => log('bootstrap error:', e.message));
 
   scheduleClaims();
+
+  // System tray (best-effort): Auto-start toggle + Quit. Skip when disabled
+  // or when there is no display / helper script.
+  if (process.env.GLM_BRIDGE_TRAY !== '0') {
+    try {
+      const trayPid = Number(fs.existsSync(TRAY_PID_PATH) ? fs.readFileSync(TRAY_PID_PATH, 'utf8') : 0);
+      const trayAlive = trayPid && isAlive(trayPid);
+      if (!trayAlive) {
+        const helper = IS_WIN ? path.join(ASSET_DIR, 'tray.ps1') : path.join(ASSET_DIR, 'tray.sh');
+        if (fs.existsSync(helper)) {
+          const d = IS_WIN
+            ? spawn('powershell', ['-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', helper],
+                { stdio: 'ignore', detached: true })
+            : spawn('sh', [helper],
+                { stdio: 'ignore', detached: true, env: { ...process.env, GLM_BRIDGE_HOME: STATE_DIR } });
+          d.unref();
+          log('tray helper started');
+        }
+      }
+    } catch (e) { log('tray start skipped:', e.message); }
+  }
 
   setInterval(async () => {
     const before = resolvedProxy;

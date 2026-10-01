@@ -23,7 +23,10 @@ login (systemd user unit on Linux, Scheduled Task on Windows), and register it
 with a local 9router if one is running.
 
 Requirements: **Node 22+** (the ZCode CLI needs `node:sqlite`) and a **ZCode
-desktop login**. Playwright Chromium is only needed if the upstream re-enables
+login**. If ZCode is missing, the installer offers to download the official
+build — size shown, your consent required, installed silently (the GUI never
+opens) — then offers the **terminal login** (prints a URL for any browser).
+Playwright Chromium is only needed if the upstream re-enables
 captcha tokens on model requests (the installer sets it up anyway).
 
 ## Control
@@ -34,12 +37,46 @@ glm-bridge stop       # stop, including any stale instance holding the port
 glm-bridge restart
 glm-bridge status     # running/stopped + readiness
 glm-bridge logs 100   # last N log lines
-glm-bridge claim      # claim the daily plan now (add --force to claim even
-                      #   when a plan already looks active)
+glm-bridge claim      # claim the daily plan for every logged-in account
 glm-bridge run        # run in foreground
+glm-bridge quit       # stop everything (bridge + tray), no respawn
+glm-bridge tray       # show the system-tray icon (Auto-start toggle + Quit)
+glm-bridge autostart  # print on|off
+glm-bridge autostart-toggle
+glm-bridge accounts   # list accounts (* = active)
+glm-bridge login [name]     # terminal OAuth login (no ZCode GUI); creates `name` if new
+glm-bridge logout [name]    # drop an account's credentials
+glm-bridge use <name>       # switch the active account
 ```
 
 Windows uses `glm-bridge.cmd` with the same subcommands.
+
+### zbridge — one command for everything
+
+`zbridge` (installed alongside `glm-bridge`) opens a mini TUI: live status,
+start/stop, account list/switch, **terminal login/logout**, claim, logs,
+tray, auto-start. `zbridge <args>` forwards to `glm-bridge <args>`.
+
+### Multiple accounts (multiple × 100M/day)
+
+Each ZCode account has its own start plan. Log in as many as you like:
+
+```bash
+zbridge                  # TUI → 6) login
+glm-bridge login work2    # creates account "work2", prints OAuth URL
+glm-bridge accounts       # * main  work2
+glm-bridge use work2      # make it active
+```
+
+When the active account hits quota (upstream code 1005), the bridge parks it
+for 24 h, rotates to the next logged-in account and retries the request
+automatically. Daily claims run for every account.
+
+### System tray
+
+On start (Linux with `yad`, Windows via `tray.ps1`) a tray icon appears with:
+**Auto-start** (toggles login autostart) and **Quit** (stops the bridge and
+the tray entirely). Disable with `GLM_BRIDGE_TRAY=0`.
 
 ## Use it
 
@@ -176,6 +213,7 @@ mount under `/tmp` is not required afterwards.
 | `GLM_BRIDGE_CLI` | auto | override path to `zcode.cjs` |
 | `GLM_BRIDGE_PROXY` | auto | force a proxy (`http://host:port`), or `""` to force direct |
 | `GLM_BRIDGE_CLAIM_AT` | `19:30` | local time for the daily plan claim |
+| `GLM_BRIDGE_TRAY` | unset | `1` default; `0` disables the system-tray icon |
 | `GLM_BRIDGE_CLAIM_DISABLE` | unset | `1` disables auto-claim |
 | `GLM_BRIDGE_PLAN` | `zcode-v3-start-plan` | plan id to claim |
 | `GLM_BRIDGE_PW` | auto | path to `playwright-core` |
@@ -195,11 +233,11 @@ curl http://127.0.0.1:3010/health    # ready + captcha pool
 |---|---|
 | `zcode.cjs not found` | ZCode not installed, or set `GLM_BRIDGE_CLI` |
 | requests hang 60 s, then `Model request was cancelled` | no route to `zcode.z.ai` — see `connectivity:` in the logs; the bridge falls back to a local proxy automatically (set `GLM_BRIDGE_PROXY` to pin one) |
-| `ZCode plan inactive or quota exhausted (1005)` | the upstream plan is gone — open the ZCode desktop app and check/re-claim it (`billing/current` returns `plans: []`) |
+| `All ZCode accounts exhausted or plan inactive (1005)` | every logged-in account is out of quota — check `glm-bridge accounts` (exhausted accounts show a pause time) and `glm-bridge claim`; log in another account with `glm-bridge login <name>` |
 | HTTP 503 from 9router, `/health` hangs | bridge not answering — `glm-bridge status`, then `logs`; a slow first request is normal (CLI spawn) |
 | `captcha token pool exhausted` | upstream re-enabled captcha and minting failed — check Chromium, `mint-captcha.js` by hand |
 | `FAILED TO PRIME device module` in logs | mint could not reach the Aliyun SDK; harmless while `skip_model_request` is `true` |
-| HTTP 401 from upstream | ZCode session expired — open ZCode once to re-login |
+| HTTP 401 from upstream | ZCode session expired — `glm-bridge login` (terminal, no GUI) |
 | HTTP 405 `code 3012` | the bridge retries once with a token; if it persists, check network to `zcode.z.ai` |
 
 ## Security

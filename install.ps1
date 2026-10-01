@@ -38,7 +38,7 @@ if (Test-Path (Join-Path $InstallDir '.git')) {
   git clone --depth 1 $RepoUrl $InstallDir
 }
 
-foreach ($f in @('glm-bridge.js', 'mint-captcha.js', 'sysblocks.json')) {
+foreach ($f in @('glm-bridge.js', 'mint-captcha.js', 'sysblocks.json', 'zbridge.js', 'tray.ps1')) {
   if (-not (Test-Path (Join-Path $InstallDir $f))) { Die "missing $f in repo" }
 }
 
@@ -51,6 +51,12 @@ $shim = Join-Path $shimDir 'glm-bridge.cmd'
 "$($node.Source)" "$InstallDir\glm-bridge.js" %*
 "@ | Set-Content -Path $shim -Encoding ASCII
 Say "installed CLI -> $shim"
+$zshim = Join-Path $shimDir 'zbridge.cmd'
+@"
+@echo off
+"$($node.Source)" "$InstallDir\zbridge.js" %*
+"@ | Set-Content -Path $zshim -Encoding ASCII
+Say "installed TUI -> $zshim"
 
 $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
 if ($userPath -notlike "*$shimDir*") {
@@ -68,6 +74,52 @@ if (-not (Test-Path (Join-Path $InstallDir 'node_modules\playwright-core'))) {
     finally { Pop-Location }
   } else {
     Say 'warn: npm not found; set GLM_BRIDGE_CHROMIUM if captcha minting fails'
+  }
+}
+
+# ------------------------------------------------------ zcode CLI bootstrap --
+# The bridge drives ZCode's own CLI. If missing, offer the official build
+# with size + explicit consent; install silently (no GUI opens), then offer
+# the CLI's terminal OAuth login.
+function Find-ZcodeCli {
+  if ($env:GLM_BRIDGE_CLI -and (Test-Path $env:GLM_BRIDGE_CLI)) { return $true }
+  $p = Join-Path $env:LOCALAPPDATA 'Programs\ZCode\resources\glm\zcode.cjs'
+  if (Test-Path $p) { return $true }
+  return (Test-Path (Join-Path $InstallDir 'squashfs-root\resources\glm\zcode.cjs'))
+}
+$ZcodeUrl = if ($env:GLM_BRIDGE_ZCODE_URL) { $env:GLM_BRIDGE_ZCODE_URL } else { 'https://cdn-zcode.z.ai/zcode/electron/releases/3.14.4/windows-x64/ZCode-3.14.4-win-x64.exe' }
+if (-not (Find-ZcodeCli)) {
+  try {
+    $head = Invoke-WebRequest -Uri $ZcodeUrl -Method Head -TimeoutSec 15 -UseBasicParsing
+    $zsize = [math]::Round($head.Headers['Content-Length'][0] / 1MB)
+    $zhuman = "$zsize MB"
+  } catch { $zhuman = 'unknown size' }
+  Write-Host "[glm-bridge] ZCode not found. Download the official installer now?" -ForegroundColor Yellow
+  Write-Host "  $ZcodeUrl"
+  Write-Host "  Size: $zhuman (installed silently - the GUI will NOT be opened)" -ForegroundColor Yellow
+  $ans = Read-Host '  Download and install? [y/N]'
+  if ($ans -match '^[yY]') {
+    Say "downloading ZCode ($zhuman)..."
+    $tmp = Join-Path $env:TEMP 'zcode-setup.exe'
+    try {
+      Invoke-WebRequest -Uri $ZcodeUrl -OutFile $tmp -UseBasicParsing
+      Say 'installing silently (no GUI)...'
+      # NSIS installer: /S = silent, /D= must be the last parameter
+      $p = Start-Process -FilePath $tmp -ArgumentList '/S' -Wait -PassThru
+      Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+      if (Find-ZcodeCli) { Say 'zcode CLI ready' } else { Say 'warn: install finished but zcode.cjs not found' }
+    } catch { Say "warn: download/install failed ($_)" }
+  } else {
+    Say 'skipped - install ZCode manually or re-run install.ps1'
+  }
+}
+
+# -------------------------------------------------------- terminal login ----
+if (-not (Test-Path (Join-Path $HOME '.zcode\v2\credentials.json'))) {
+  $ans = Read-Host 'No ZCode login found. Log in now, in this terminal? (prints a URL for any browser) [y/N]'
+  if ($ans -match '^[yY]') {
+    & $node.Source (Join-Path $InstallDir 'glm-bridge.js') login main
+    if ($LASTEXITCODE -ne 0) { Say 'warn: login failed (re-run: glm-bridge login)' }
   }
 }
 

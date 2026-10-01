@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "description": "Local OpenAI/Anthropic-compatible bridge for Z.ai GLM via a ZCode subscription",
-  "bin": { "glm-bridge": "glm-bridge.js" },
+  "bin": { "glm-bridge": "glm-bridge.js", "zbridge": "zbridge.js" },
   "scripts": {
     "start": "node glm-bridge.js start",
     "stop": "node glm-bridge.js stop",

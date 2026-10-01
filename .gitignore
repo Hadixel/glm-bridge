@@ -14,3 +14,7 @@ package-lock.json
 # extracted AppImage / ZCode resources
 zcode-root/
 *.AppImage
+tray.pid
+tray.log
+accounts.json
+accounts/

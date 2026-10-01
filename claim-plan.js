@@ -264,7 +264,14 @@ async function planActive() {
     j = tryParse(direct);
   }
   const plans = (j && j.data && j.data.plans) || [];
-  return plans.some(p => String(p.status || '').toLowerCase() === 'active') || plans.length > 0;
+  // Only a plan that is active *right now* counts. `plans.length > 0` used to
+  // be enough, which kept an expired-but-still-listed plan suppressing every
+  // claim after the first day — the "claim never works" bug.
+  const nowSec = Math.floor(Date.now() / 1000);
+  return plans.some(p => {
+    if (String(p.status || '').toLowerCase() !== 'active') return false;
+    return !Number.isFinite(p.ends_at) || p.ends_at > nowSec;
+  });
 }
 
 (async () => {
@@ -288,38 +295,49 @@ async function planActive() {
     say('FULL PARAM (' + full.length + ' chars): ' + full);
     try { say('param keys: ' + JSON.stringify(Object.keys(JSON.parse(full)))); } catch { say('param is not JSON'); }
   }
-  let signedShape = null;
-  try {
-    const o = JSON.parse(String(param));
-    if (o && o.deviceToken) {
-      signedShape = Buffer.from(JSON.stringify({
-        captchaId: process.env.ZCODE_CAPTCHA_ID || 'MBmzpRpV',
-        sceneId: o.sceneId || '11xygtvd',
-        isSign: true,
-        securityToken: o.deviceToken,
-      })).toString('base64');
-    }
-  } catch { /* not json */ }
-  const variants = [
-    ['signed-b64', signedShape],
-    ['raw-json', String(param)],
-    ['b64-json', Buffer.from(String(param)).toString('base64')],
-  ].filter(v => v[1]);
+  // The SDK callback yields {sceneId, certifyId, deviceToken}; the upstream
+  // accepts the raw string as-is (the desktop sends it verbatim). Variants are
+  // rebuilt from the *current* param every round: a fresh mint used to be
+  // discarded while the loop kept replaying the stale one (3007 forever).
+  const encodeVariants = p => {
+    let signedShape = null;
+    try {
+      const o = JSON.parse(String(p));
+      if (o && o.deviceToken) {
+        signedShape = Buffer.from(JSON.stringify({
+          captchaId: process.env.ZCODE_CAPTCHA_ID || 'MBmzpRpV',
+          sceneId: o.sceneId || '11xygtvd',
+          isSign: true,
+          securityToken: o.deviceToken,
+        })).toString('base64');
+      }
+    } catch { /* not json */ }
+    return [
+      ['raw-json', String(p)],
+      ['signed-b64', signedShape],
+      ['b64-json', Buffer.from(String(p)).toString('base64')],
+    ].filter(v => v[1]);
+  };
   let last = { status: 0, body: 'no attempt' };
-  for (const [name, value] of variants) {
-    say(`claim attempt (${name})...`);
-    last = await claim(value, PLAN_ID);
-    say(`${name} -> HTTP ${last.status} ${String(last.body).slice(0, 200)}`);
-    if (last.status === 200 && /"code"\s*:\s*0/.test(String(last.body))) {
-      emit({ ok: true, claimed: true, planId: PLAN_ID, encoding: name,
-        detail: String(last.body).slice(0, 500) });
-      return;
-    }
-    if (/3007|captcha/i.test(String(last.body))) {  // param rejected -> mint a fresh one
+  for (let round = 0; round < 2; round++) {
+    if (round > 0) {
       try { param = await mintParam(); } catch { /* keep the old one */ }
-    } else if (!/captcha/i.test(String(last.body)) && last.status >= 400) {
-      break;  // not a captcha problem; no point trying more encodings
+      say('re-minted captcha param for round 2');
     }
+    let captchaRejected = false;
+    for (const [name, value] of encodeVariants(param)) {
+      say(`claim attempt (${name}, round ${round + 1})...`);
+      last = await claim(value, PLAN_ID);
+      say(`${name} -> HTTP ${last.status} ${String(last.body).slice(0, 200)}`);
+      if (last.status === 200 && /"code"\s*:\s*0/.test(String(last.body))) {
+        emit({ ok: true, claimed: true, planId: PLAN_ID, encoding: name,
+          detail: String(last.body).slice(0, 500) });
+        return;
+      }
+      if (/3007|captcha/i.test(String(last.body))) { captchaRejected = true; continue; }
+      if (last.status >= 400) { round = 2; break; }  // not a captcha problem; stop
+    }
+    if (!captchaRejected) break;  // a non-captcha failure already ended the round
   }
   emit({ ok: false, claimed: false, planId: PLAN_ID, status: last.status,
     detail: String(last.body).slice(0, 500) });
