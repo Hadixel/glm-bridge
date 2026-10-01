@@ -490,12 +490,19 @@ class ZcodeClient {
   start() {
     const cli = resolveCliRoot();
     if (!cli) {
-      log('zcode.cjs not found (open the ZCode app, or set GLM_BRIDGE_CLI); retrying in 10s');
+      this.waitReason = 'zcode.cjs not found — install/open the ZCode desktop app once (needs ~/.zcode credentials), or set GLM_BRIDGE_CLI; retrying every 10s';
+      log(this.waitReason);
       setTimeout(() => this.start(), 10_000);
       return;
     }
     const builtinFile = findBuiltinFile();
-    if (!builtinFile) { log('zcode-builtin.json not found; retrying in 10s'); setTimeout(() => this.start(), 10_000); return; }
+    if (!builtinFile) {
+      this.waitReason = 'zcode-builtin.json not found next to the CLI; retrying every 10s';
+      log(this.waitReason);
+      setTimeout(() => this.start(), 10_000);
+      return;
+    }
+    this.waitReason = null;
     const env = {
       ...process.env,
       ...proxyEnv(),
@@ -503,6 +510,8 @@ class ZcodeClient {
       ZCODE_PERSONAL_PROVIDER_CONFIG_FILE: path.join(ZCODE_DIR, 'v2', 'provider_config.json'),
     };
     log('spawning CLI:', cli, '| builtin:', builtinFile);
+    this.lastStderr = null;
+    this.waitReason = 'spawning CLI';
     this.child = spawn(process.execPath, [cli, 'app-server', '--stdio', '--surface', 'terminal'], {
       cwd: WORKSPACE, env, stdio: ['pipe', 'pipe', 'pipe'],
     });
@@ -521,10 +530,14 @@ class ZcodeClient {
       }
     });
     this.child.stderr.on('data', d => {
-      for (const l of String(d).split('\n')) if (l.trim()) log('cli:', l.slice(0, 300));
+      for (const l of String(d).split('\n')) if (l.trim()) {
+        this.lastStderr = l.slice(0, 300);
+        log('cli:', this.lastStderr);
+      }
     });
     this.child.on('exit', code => {
-      log('CLI exited with', code, '- restarting in', this.restartDelay, 'ms');
+      this.waitReason = `CLI exited (code ${code}), restarting in ${this.restartDelay} ms${this.lastStderr ? ` — last stderr: ${this.lastStderr}` : ''}`;
+      log(this.waitReason);
       this.ready = false;
       for (const [, p] of this.pending) p.resolve({ error: { message: 'CLI exited' } });
       this.pending.clear();
@@ -626,7 +639,7 @@ class ZcodeClient {
   }
 
   // Serialize upstream calls: Aliyun captcha can reject duplicate concurrent submits.
-  generate({ systemBlocks, messages, tools, maxOutputTokens, reasoningLevel }) {
+  generate({ systemBlocks, messages, tools, maxOutputTokens, reasoningLevel, modelId }) {
     const run = async () => {
       if (!this.ready) {
         // one nudge in case sync is lagging
@@ -637,7 +650,7 @@ class ZcodeClient {
         workspace: { workspacePath: WORKSPACE, workspaceKey: WORKSPACE },
         selection: {
           providerId: 'account:zai-start-plan',
-          modelId: 'GLM-5.3-Flash',
+          modelId: modelId || 'GLM-5.3-Flash',
           options: { reasoningLevel: reasoningLevel || 'max' },
         },
         messages: [...systemBlocks, ...messages],
@@ -652,6 +665,20 @@ class ZcodeClient {
       if (r.error && /3012|unusual activity|captcha/i.test(JSON.stringify(r.error))) {
         forceCaptchaRequired('upstream rejected the request');
         await sleep(400);
+        r = await sendOnce();
+      }
+      // The cached account revision may not list a newly added model (e.g.
+      // GLM-5.3 joined the plan after the desktop last wrote its log). If the
+      // upstream rejects the model as unknown/unentitled, retry once on the
+      // plan's baseline Flash and remember what worked.
+      if (r.error && params.selection.modelId !== 'GLM-5.3-Flash'
+          && /model|entitle|not\s*(?:found|supported|available)|not_entitled|invalid/i.test(JSON.stringify(r.error))) {
+        this.rejectedModels = this.rejectedModels || new Set();
+        if (!this.rejectedModels.has(params.selection.modelId)) {
+          log(`model ${params.selection.modelId} rejected (${JSON.stringify(r.error).slice(0, 200)}), retrying with GLM-5.3-Flash`);
+          this.rejectedModels.add(params.selection.modelId);
+        }
+        params.selection.modelId = 'GLM-5.3-Flash';
         r = await sendOnce();
       }
       if (r.error) {
@@ -808,18 +835,28 @@ function getClient() {
   return client;
 }
 
+// Start plan (rev-30 builtin, CLI 3.14.4): GLM-5.3-Flash, GLM-5.2, GLM-5-Turbo.
+// Plain GLM-5.3 belongs to the coding-plan providers; if the start plan
+// rejects it, generate() falls back to Flash automatically.
 const MODEL_ALIAS = new Map([
+  ['glm-5.3', 'GLM-5.3'],
   ['glm-5.3-flash', 'GLM-5.3-Flash'],
-  ['glm-5.3', 'GLM-5.3-Flash'],
-  ['glm-5.2', 'GLM-5.3-Flash'],
-  ['glm-4.7', 'GLM-5.3-Flash'],
+  ['glm-flash', 'GLM-5.3-Flash'],
+  ['glm-5.2', 'GLM-5.2'],
+  ['glm-5-turbo', 'GLM-5-Turbo'],
+  ['glm-turbo', 'GLM-5-Turbo'],
 ]);
 function resolveModel(name) {
   if (!name) return 'GLM-5.3-Flash';
   const key = String(name).toLowerCase();
-  if (key === 'glm-5.3-flash') return 'GLM-5.3-Flash';
   if (MODEL_ALIAS.has(key)) return MODEL_ALIAS.get(key);
-  return 'GLM-5.3-Flash'; // single entitled model; echo requested id in responses
+  // tolerate prefixed/suffixed ids harnesses send (e.g. "zcode/glm-5.3",
+  // "glm-5.3-flash@preview")
+  if (/turbo/.test(key)) return 'GLM-5-Turbo';
+  if (/flash/.test(key)) return 'GLM-5.3-Flash';
+  if (/5\.3/.test(key)) return 'GLM-5.3';
+  if (/5\.2/.test(key)) return 'GLM-5.2';
+  return 'GLM-5.3-Flash'; // default; echo requested id in responses
 }
 
 function clampMaxTokens(n, dflt = 8192) {
@@ -894,6 +931,7 @@ async function handleChatCompletions(req, res, body) {
     tools: openaiToolDefs(body.tools),
     maxOutputTokens: clampMaxTokens(body.max_tokens ?? body.max_completion_tokens),
     reasoningLevel: reasoningFromRequest(body),
+    modelId: model,
   });
   if (out.error) {
     return sendJson(res, 502, { error: { message: `upstream: ${out.error.message || JSON.stringify(out.error)}`, type: 'upstream_error' } });
@@ -958,6 +996,7 @@ async function handleAnthropicMessages(req, res, body, stream) {
     }))),
     maxOutputTokens: clampMaxTokens(body.max_tokens),
     reasoningLevel: reasoningFromRequest(body),
+    modelId: resolveModel(requestedModel),
   });
   if (out.error) {
     return sendJson(res, 502, { type: 'error', error: { type: 'api_error', message: `upstream: ${out.error.message || JSON.stringify(out.error)}` } });
@@ -1036,14 +1075,35 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://localhost');
   try {
     if (req.method === 'GET' && url.pathname === '/health') {
-      return sendJson(res, 200, { ok: true, ready: !!(client && client.ready), captchaPool: tokens.length, cliRunning: !!(client && client.child && client.child.exitCode === null) });
+      const jwtOk = (() => { try { loadJwt(); return true; } catch { return false; } })();
+      if (!client) {
+        return sendJson(res, 200, {
+          ok: true, ready: false, captchaPool: tokens.length, cliRunning: false,
+          detail: !jwtOk
+            ? 'no ZCode credentials (~/.zcode/v2/credentials.json missing or unreadable) — log in to the ZCode desktop app once on this machine'
+            : 'bootstrap pending (connectivity probe / CLI startup)',
+        });
+      }
+      const cliRunning = !!(client.child && client.child.exitCode === null);
+      return sendJson(res, 200, {
+        ok: true,
+        ready: !!client.ready,
+        captchaPool: tokens.length,
+        cliRunning,
+        credentials: jwtOk,
+        detail: !cliRunning ? (client.waitReason || 'CLI not running')
+          : !jwtOk ? 'CLI running but ZCode credentials missing'
+          : client.ready ? null : (client.waitReason || 'CLI up, syncing account config'),
+      });
     }
     if (!checkAuth(req)) return sendJson(res, 401, { error: { message: 'invalid api key', type: 'invalid_request_error' } });
 
     if (req.method === 'GET' && url.pathname === '/v1/models') {
       return sendJson(res, 200, { object: 'list', data: [
-        { id: 'GLM-5.3-Flash', object: 'model', owned_by: 'zcode-start-plan', created: created_ts },
+        { id: 'glm-5.3', object: 'model', owned_by: 'zcode-start-plan', created: created_ts },
         { id: 'glm-5.3-flash', object: 'model', owned_by: 'zcode-start-plan', created: created_ts },
+        { id: 'glm-5.2', object: 'model', owned_by: 'zcode-start-plan', created: created_ts },
+        { id: 'glm-5-turbo', object: 'model', owned_by: 'zcode-start-plan', created: created_ts },
       ] });
     }
     if (req.method === 'POST' && url.pathname === '/v1/chat/completions') {
@@ -1371,10 +1431,12 @@ function boot() {
     log(`glm-bridge listening on http://127.0.0.1:${config.port}/v1 (key: ${config.key})`);
   });
 
-  // Probe connectivity first: the CLI child inherits the proxy env we pick,
-  // so it must be decided before the child is spawned.
+  // Spawn the CLI immediately; when the connectivity probe settles on a
+  // non-direct route, the periodic checker respawns the child (SIGHUP ->
+  // exit handler) so it inherits the proxy env. This keeps /health truthful
+  // within seconds on machines where every probe times out (VPN off etc.).
+  getClient();
   resolveProxy(true)
-    .then(() => getClient())
     .then(() => captchaPolicyRequired())
     .then(req => { if (req) ensureTokens(); })
     .catch(e => log('bootstrap error:', e.message));
