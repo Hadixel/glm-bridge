@@ -31,6 +31,7 @@ const PLAN_ID = argOf('--plan', process.env.GLM_BRIDGE_PLAN || 'zcode-v3-start-p
 const JSON_OUT = args.includes('--json');
 const DRY = args.includes('--dry-run');
 const FORCE = args.includes('--force');   // claim even if a plan already looks active
+const PREVIEW_ONLY = args.includes('--preview');  // list claimable offers, no claim
 const PROXY = process.env.GLM_BRIDGE_PROXY || 'http://127.0.0.1:10809';
 // The captcha browser must use the SAME route as the claim request or the
 // verify param is rejected. Direct works whenever egress is up; the proxy is
@@ -40,6 +41,25 @@ const MINT_PROXY = process.env.MINT_PROXY || process.env.GLM_BRIDGE_MINT_PROXY |
 const HOME = os.homedir();
 const say = m => { if (!JSON_OUT) process.stderr.write('[claim] ' + m + '\n'); };
 const emit = obj => console.log(JSON.stringify(obj));
+
+// The desktop attaches X-Device-Mid to EVERY API call (preview returns 3001
+// without it); it lives beside the credentials in telemetry-state.json.
+function deviceMid() {
+  try {
+    const credFile = process.env.ZCODE_CREDENTIALS || path.join(HOME, '.zcode', 'v2', 'credentials.json');
+    const state = path.join(path.dirname(credFile), 'telemetry-state.json');
+    const mid = JSON.parse(fs.readFileSync(state, 'utf8')).deviceMid;
+    return typeof mid === 'string' && mid ? mid : '';
+  } catch { return ''; }
+}
+const SOURCE_HEADERS = () => {
+  const h = ['-H', 'X-ZCode-App-Version: 3.14.4',
+             '-H', `X-Platform: ${process.platform}-${process.arch}`,
+             '-H', 'X-Client-Language: en-US'];
+  const mid = deviceMid();
+  if (mid) h.push('-H', 'X-Device-Mid: ' + mid);
+  return h;
+};
 
 // ------------------------------------------------------------- credentials --
 function zcodeJwt() {
@@ -215,8 +235,7 @@ function curlClaim(paramHeader, planId, useProxy) {
   const args = ['-sS', '-m', '45', '-o', '-', '-w', '\n__CODE__%{http_code}',
     '-H', 'Content-Type: application/json',
     '-H', 'Authorization: Bearer ' + jwt,
-    '-H', 'X-ZCode-App-Version: 3.14.4',
-    '-H', `X-Platform: ${process.platform}-${process.arch}`,
+    ...SOURCE_HEADERS(),
     '-H', 'X-Aliyun-Captcha-Verify-Region: sgp',
     '-H', 'X-Aliyun-Captcha-Verify-Param: ' + paramHeader,
     '-H', 'User-Agent: ZCode/3.14.4',
@@ -244,6 +263,34 @@ async function claim(paramHeader, planId) {
 }
 
 // Is the plan already active? (avoid pointless claims)
+// Which plans are currently claimable? The desktop asks preview first and
+// claims whatever it returns — the offer id changes (the active one yesterday
+// was zcode-v3-start-plan-trust-1002, NOT the hardcoded zcode-v3-start-plan).
+// Requires X-Device-Mid (3001 without it). Returns [] on any failure.
+async function previewPlans() {
+  const jwt = zcodeJwt();
+  const url = 'https://zcode.z.ai/api/v1/zcode-plan/billing/preview'
+    + '?app_version=3.14.4&platform=' + `${process.platform}-${process.arch}`;
+  const args = ['-sS', '-m', '30', '-o', '-', '-w', '\n__CODE__%{http_code}',
+    '-H', 'Authorization: Bearer ' + jwt,
+    ...SOURCE_HEADERS(),
+    '-H', 'User-Agent: ZCode/3.14.4', url];
+  const out = await new Promise(res => execFile('curl', args,
+    { timeout: 40000 }, (e, so) => res(String(so || ''))));
+  const i = out.lastIndexOf('\n__CODE__');
+  if (i < 0) return null;
+  const body = out.slice(0, i);
+  try {
+    const j = JSON.parse(body);
+    if (!j || j.code !== 0 || !j.data) return null;
+    return (j.data.plans || []).map(p => ({
+      planId: String(p.plan_id || '').trim(),
+      name: p.name || '',
+      status: String(p.status || '').toLowerCase(),
+    })).filter(p => p.planId && p.status !== 'active');
+  } catch { return null; }
+}
+
 async function planActive() {
   const jwt = zcodeJwt();
   const url = 'https://zcode.z.ai/api/v1/zcode-plan/billing/current?app_version=3.14.4&platform='
@@ -275,72 +322,92 @@ async function planActive() {
 }
 
 (async () => {
+  if (PREVIEW_ONLY) {
+    const prev = await previewPlans().catch(() => null);
+    emit(prev === null ? { ok: false, reason: 'preview-unreachable' }
+      : { ok: true, plans: prev });
+    return;
+  }
   if (!FORCE && await planActive().catch(() => false)) {
     emit({ ok: true, claimed: false, reason: 'already-active', planId: PLAN_ID });
     return;
   }
-  say('plan inactive, minting captcha param...');
-  let param;
-  try { param = await mintParam(); }
-  catch (e) { emit({ ok: false, claimed: false, planId: PLAN_ID, detail: 'captcha mint failed: ' + e.message }); process.exit(1); }
-
-  if (DRY) { emit({ ok: true, dryRun: true, planId: PLAN_ID, param: String(param).slice(0, 60) }); return; }
-
-  // Header encodings to try: raw JSON first (what the SDK produced), then b64.
-  // The SDK callback yields {sceneId, certifyId, deviceToken}. The upstream
-  // historically accepted the signed shape {captchaId, sceneId, isSign,
-  // securityToken} (base64), so try that first, then the raw forms.
-  if (process.env.GLM_BRIDGE_DEBUG === '1') {
-    const full = String(param);
-    say('FULL PARAM (' + full.length + ' chars): ' + full);
-    try { say('param keys: ' + JSON.stringify(Object.keys(JSON.parse(full)))); } catch { say('param is not JSON'); }
+  // Discover the real offer ids from preview (desktop behaviour); fall back to
+  // the configured plan id when preview is unreachable or lists nothing.
+  let targets = [{ planId: PLAN_ID, name: 'configured' }];
+  const prev = await previewPlans().catch(() => null);
+  if (prev && prev.length) {
+    targets = prev;
+    say('preview offers: ' + prev.map(p => `${p.planId}${p.name ? ` (${p.name})` : ''}`).join(', '));
+  } else {
+    say('preview empty/unreachable, falling back to plan id ' + PLAN_ID);
   }
-  // The SDK callback yields {sceneId, certifyId, deviceToken}; the upstream
-  // accepts the raw string as-is (the desktop sends it verbatim). Variants are
-  // rebuilt from the *current* param every round: a fresh mint used to be
-  // discarded while the loop kept replaying the stale one (3007 forever).
-  const encodeVariants = p => {
-    let signedShape = null;
-    try {
-      const o = JSON.parse(String(p));
-      if (o && o.deviceToken) {
-        signedShape = Buffer.from(JSON.stringify({
-          captchaId: process.env.ZCODE_CAPTCHA_ID || 'MBmzpRpV',
-          sceneId: o.sceneId || '11xygtvd',
-          isSign: true,
-          securityToken: o.deviceToken,
-        })).toString('base64');
-      }
-    } catch { /* not json */ }
-    return [
-      ['raw-json', String(p)],
-      ['signed-b64', signedShape],
-      ['b64-json', Buffer.from(String(p)).toString('base64')],
-    ].filter(v => v[1]);
-  };
-  let last = { status: 0, body: 'no attempt' };
-  for (let round = 0; round < 2; round++) {
-    if (round > 0) {
-      try { param = await mintParam(); } catch { /* keep the old one */ }
-      say('re-minted captcha param for round 2');
+  let anyClaimed = false; let lastErr = null;
+  for (const t of targets) {
+    say(`plan inactive, minting captcha param for ${t.planId}...`);
+    let param;
+    try { param = await mintParam(); }
+    catch (e) { lastErr = 'captcha mint failed: ' + e.message; say(lastErr); continue; }
+
+    if (DRY) { emit({ ok: true, dryRun: true, planId: t.planId, param: String(param).slice(0, 60) }); return; }
+
+    if (process.env.GLM_BRIDGE_DEBUG === '1') {
+      const full = String(param);
+      say('FULL PARAM (' + full.length + ' chars): ' + full);
+      try { say('param keys: ' + JSON.stringify(Object.keys(JSON.parse(full)))); } catch { say('param is not JSON'); }
     }
-    let captchaRejected = false;
-    for (const [name, value] of encodeVariants(param)) {
-      say(`claim attempt (${name}, round ${round + 1})...`);
-      last = await claim(value, PLAN_ID);
-      say(`${name} -> HTTP ${last.status} ${String(last.body).slice(0, 200)}`);
-      if (last.status === 200 && /"code"\s*:\s*0/.test(String(last.body))) {
-        emit({ ok: true, claimed: true, planId: PLAN_ID, encoding: name,
-          detail: String(last.body).slice(0, 500) });
-        return;
+    // The SDK callback yields {sceneId, certifyId, deviceToken}; the upstream
+    // accepts the raw string as-is (the desktop sends it verbatim). Variants are
+    // rebuilt from the *current* param every round: a fresh mint used to be
+    // discarded while the loop kept replaying the stale one (3007 forever).
+    const encodeVariants = p => {
+      let signedShape = null;
+      try {
+        const o = JSON.parse(String(p));
+        if (o && o.deviceToken) {
+          signedShape = Buffer.from(JSON.stringify({
+            captchaId: process.env.ZCODE_CAPTCHA_ID || 'MBmzpRpV',
+            sceneId: o.sceneId || '11xygtvd',
+            isSign: true,
+            securityToken: o.deviceToken,
+          })).toString('base64');
+        }
+      } catch { /* not json */ }
+      return [
+        ['raw-json', String(p)],
+        ['signed-b64', signedShape],
+        ['b64-json', Buffer.from(String(p)).toString('base64')],
+      ].filter(v => v[1]);
+    };
+    let last = { status: 0, body: 'no attempt' };
+    let targetFailed = false;
+    for (let round = 0; round < 2 && !targetFailed; round++) {
+      if (round > 0) {
+        try { param = await mintParam(); } catch { /* keep the old one */ }
+        say('re-minted captcha param for round 2');
       }
-      if (/3007|captcha/i.test(String(last.body))) { captchaRejected = true; continue; }
-      if (last.status >= 400) { round = 2; break; }  // not a captcha problem; stop
+      let captchaRejected = false;
+      for (const [name, value] of encodeVariants(param)) {
+        say(`claim attempt ${t.planId} (${name}, round ${round + 1})...`);
+        last = await claim(value, t.planId);
+        say(`${name} -> HTTP ${last.status} ${String(last.body).slice(0, 200)}`);
+        if (last.status === 200 && /"code"\s*:\s*0/.test(String(last.body))) {
+          anyClaimed = true;
+          emit({ ok: true, claimed: true, planId: t.planId, encoding: name,
+            detail: String(last.body).slice(0, 500) });
+          break;
+        }
+        if (/3007|captcha/i.test(String(last.body))) { captchaRejected = true; continue; }
+        if (last.status >= 400) { targetFailed = true; break; }  // not captcha; stop target
+      }
+      if (anyClaimed) break;
+      if (!captchaRejected) break;  // a non-captcha failure already ended the round
     }
-    if (!captchaRejected) break;  // a non-captcha failure already ended the round
+    if (anyClaimed) break;
+    lastErr = `claim failed for ${t.planId}: HTTP ${last.status} ${String(last.body).slice(0, 200)}`;
   }
-  emit({ ok: false, claimed: false, planId: PLAN_ID, status: last.status,
-    detail: String(last.body).slice(0, 500) });
+  if (anyClaimed) return;
+  emit({ ok: false, claimed: false, planId: PLAN_ID, detail: lastErr || 'no attempt' });
   process.exit(1);
 })().catch(e => {
   emit({ ok: false, claimed: false, planId: PLAN_ID, detail: (e && e.message) || String(e) });
