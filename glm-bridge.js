@@ -783,7 +783,7 @@ class ZcodeClient {
       }
       if (r.error) {
         const msg = JSON.stringify(r.error);
-        log('generateText error:', msg.slice(0, 500));
+        log('generateText error (req=' + requestedModel + ' eff=' + effectiveModel + '):', msg.slice(0, 3000));
         // code 1005 = this account's plan is exhausted (or inactive). Park it
         // and retry once on the next logged-in account, if any.
         if (/exceed quota|1005/.test(msg)) {
