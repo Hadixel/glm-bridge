@@ -163,19 +163,30 @@ The bridge claims it for you:
   (throttled to one attempt per 10 min).
 
 Claiming needs the desktop's Aliyun captcha flow, which only runs inside a
-real browser page. `claim-plan.js` therefore replays the desktop app's exact
-`initAliyunCaptcha` setup on `zcode.z.ai` (popup mode, a real `<button>`
-trigger, `showErrorTip:false`) in headless Chromium, captures the verify param
-from `captchaVerifyCallback`, and POSTs it to
-`/api/v1/zcode-plan/billing/claim`. Minting is retried with a fresh page
-because the SDK intermittently completes without invoking the callback.
+real browser page. `claim-plan.js` replays it in headless Chromium:
+
+1. `GET /billing/preview` (with `X-Device-Mid`) discovers the real offer ids —
+   the hardcoded `zcode-v3-start-plan` id goes stale (offers like
+   `zcode-v3-start-plan-trust-1002` rotate). An **empty but answered** preview
+   means nothing to claim and the script exits cleanly.
+2. Mints a **traceless** token: it waits for the SDK's `getInstance` callback
+   before calling `startTracelessVerification()` (calling it on a timer silently
+   no-ops and forces the interactive path, whose tokens upstream rejects with
+   3007). The `success`-callback param is what gets sent — same as the desktop.
+3. POSTs **once** as raw JSON to `/api/v1/zcode-plan/billing/claim`. The param
+   is single-use: extra encodings/retries only re-verify a consumed token and
+   guarantee 3007. One fresh re-mint after a 15s rate window is the only retry.
 
 Requirements: Playwright Chromium (`npm i playwright-core` plus
 `npx playwright install chromium`). Auto-claim can be turned off with
 `GLM_BRIDGE_CLAIM_DISABLE=1`.
 
-Run `glm-bridge claim` to trigger it by hand; results are logged as
-`claim: {...}` and can be seen with `glm-bridge logs`.
+Run `glm-bridge claim` to trigger it by hand (add `--preview` to just list
+offers). If a claim ever fails with `3007 captcha verify failed`, the bridge
+says so explicitly — open the **ZCode desktop app and click Claim on the 100M
+tokens card**; the bridge picks the plan up within a minute. `/health` also
+reports `quota`/`plan`/`action` so `zbridge` shows a loud banner when tokens
+are out and exactly what to do.
 
 ## How it works
 
