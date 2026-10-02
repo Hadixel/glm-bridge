@@ -70,11 +70,23 @@ function accountCredFile(acc) { return path.join(acc.dir, '.zcode', 'v2', 'crede
 // account for 24 h and move to another logged-in account, so each account's
 // own 100M/day plan gets used in turn. Returns true when a live child is now
 // bound to a different account (caller retries its request once).
+// Park an exhausted account only until the next daily renewal (CLAIM_AT,
+// default 19:30 local): the plan re-grants 100M then, so a flat 24h park
+// would wrongly skip a renewed account for hours.
+function nextRenewalMs() {
+  const parts = String(process.env.GLM_BRIDGE_CLAIM_AT || '19:30').split(':');
+  const hh = Number.isFinite(Number(parts[0])) ? Number(parts[0]) : 19;
+  const mm = Number.isFinite(Number(parts[1])) ? Number(parts[1]) : 30;
+  const next = new Date();
+  next.setHours(hh, mm, 0, 0);
+  if (next.getTime() <= Date.now() + 5 * 60_000) next.setDate(next.getDate() + 1);
+  return next.getTime() + 10 * 60_000;  // renewal + claim grace
+}
 function rotateAccount(reason) {
   const a = loadAccounts();
   const cur = a.accounts.find(x => x.name === a.active);
   if (!cur) return false;
-  cur.exhaustedUntil = Date.now() + 24 * 3600_000;
+  cur.exhaustedUntil = nextRenewalMs();
   const next = a.accounts.find(x =>
     x.name !== cur.name && fs.existsSync(accountCredFile(x)) &&
     !(x.exhaustedUntil && x.exhaustedUntil > Date.now()));
