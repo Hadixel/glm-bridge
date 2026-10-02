@@ -763,6 +763,13 @@ class ZcodeClient {
         if (r2.result) result = r2.result;
         else if (r2.error) return { error: r2.error };
       }
+      // A successful completion proves quota is back: drop the rotation park
+      // so this account can be selected again (checked lazily, one read).
+      try {
+        const a = loadAccounts();
+        const cur = a.accounts.find(x => x.name === a.active);
+        if (cur && cur.exhaustedUntil) { delete cur.exhaustedUntil; saveAccounts(a); }
+      } catch { /* non-fatal */ }
       return { result };
     };
     const p = this.queue.then(run, run);
@@ -1342,10 +1349,16 @@ function scheduleClaims() {
 // ------------------------------------------------------- autostart / tray ---
 function autostartOn() {
   if (IS_WIN) {
-    try { execFileSync('schtasks', ['/Query', '/TN', SERVICE_NAME], { stdio: 'pipe' }); return true; } catch { return false; }
+    // /XML output is not localized and distinguishes disabled tasks from
+    // existing ones (plain /Query returns 0 even for a disabled task).
+    try {
+      const xml = execFileSync('schtasks', ['/Query', '/TN', SERVICE_NAME, '/XML'],
+        { stdio: 'pipe', timeout: 15_000 }).toString();
+      return /<Enabled>true<\/Enabled>/.test(xml);
+    } catch { return false; }
   }
   // systemd user unit if installed, else the XDG autostart entry
-  try { execFileSync('systemctl', ['--user', 'is-enabled', SERVICE_NAME + '.service'], { stdio: 'pipe' }); return true; }
+  try { execFileSync('systemctl', ['--user', 'is-enabled', SERVICE_NAME + '.service'], { stdio: 'pipe', timeout: 15_000 }); return true; }
   catch (e) { if (String(e.stdout || '').trim() === 'enabled') return true; }
   return fs.existsSync(path.join(HOME, '.config', 'autostart', SERVICE_NAME + '.desktop'));
 }
@@ -1497,6 +1510,11 @@ async function ctl() {
       if (service.kind === 'systemd') {
         execFileSync('systemctl', ['--user', action, service.name], { stdio: 'pipe', timeout: 30_000 });
       } else if (action === 'start') {
+        execFileSync('schtasks', ['/Run', '/TN', service.name], { stdio: 'pipe', timeout: 30_000 });
+      } else if (action === 'restart') {
+        // schtasks has no restart: End is best-effort (task may not be running),
+        // then Run it again — End alone left Windows restarts timing out.
+        try { execFileSync('schtasks', ['/End', '/TN', service.name], { stdio: 'pipe', timeout: 30_000 }); } catch { /* not running */ }
         execFileSync('schtasks', ['/Run', '/TN', service.name], { stdio: 'pipe', timeout: 30_000 });
       } else {
         execFileSync('schtasks', ['/End', '/TN', service.name], { stdio: 'pipe', timeout: 30_000 });
