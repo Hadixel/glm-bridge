@@ -1480,13 +1480,19 @@ function startTray() {
     if (!fs.existsSync(ps1)) { console.error('tray.ps1 missing'); process.exitCode = 1; return; }
     spawn('powershell', ['-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', ps1],
       { stdio: 'ignore', detached: true }).unref();
-    console.log('tray started');
+    console.log('tray started (Windows NotifyIcon)');
+    return;
+  }
+  const py = path.join(ASSET_DIR, 'tray.py');
+  if (fs.existsSync(py)) {
+    spawn('python3', [py], { stdio: 'ignore', detached: true, env: { ...process.env, GLM_BRIDGE_HOME: STATE_DIR } }).unref();
+    console.log('tray started (AppIndicator)');
     return;
   }
   const sh = path.join(ASSET_DIR, 'tray.sh');
-  if (!fs.existsSync(sh)) { console.error('tray.sh missing'); process.exitCode = 1; return; }
+  if (!fs.existsSync(sh)) { console.error('tray helper missing'); process.exitCode = 1; return; }
   spawn('sh', [sh], { stdio: 'ignore', detached: true, env: { ...process.env, GLM_BRIDGE_HOME: STATE_DIR } }).unref();
-  console.log('tray started');
+  console.log('tray started (legacy)');
 }
 
 // ------------------------------------------------------ account commands ----
@@ -1742,7 +1748,7 @@ async function ctl() {
     }
     for (const t of targets) {
       try {
-        if (IS_WIN) execFileSync('taskkill', ['/PID', String(t), '/T', '/F'], { stdio: 'pipe' });
+        if (IS_WIN) execFileSync('taskkill', ['/PID', String(t), '/T', '/F'], { stdio: 'pipe', timeout: 10_000 });
         else { try { process.kill(-t, 'SIGTERM'); } catch { process.kill(t, 'SIGTERM'); } }
         console.log(`stopped (pid ${t})`);
       } catch (e) { console.error(`stop failed (pid ${t}):`, e.message); }
@@ -1801,15 +1807,25 @@ function boot() {
       const trayPid = Number(fs.existsSync(TRAY_PID_PATH) ? fs.readFileSync(TRAY_PID_PATH, 'utf8') : 0);
       const trayAlive = trayPid && isAlive(trayPid);
       if (!trayAlive) {
-        const helper = IS_WIN ? path.join(ASSET_DIR, 'tray.ps1') : path.join(ASSET_DIR, 'tray.sh');
-        if (fs.existsSync(helper)) {
-          const d = IS_WIN
-            ? spawn('powershell', ['-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', helper],
-                { stdio: 'ignore', detached: true })
-            : spawn('sh', [helper],
-                { stdio: 'ignore', detached: true, env: { ...process.env, GLM_BRIDGE_HOME: STATE_DIR } });
-          d.unref();
-          log('tray helper started');
+        if (IS_WIN) {
+          const ps1 = path.join(ASSET_DIR, 'tray.ps1');
+          if (fs.existsSync(ps1)) {
+            spawn('powershell', ['-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', ps1],
+              { stdio: 'ignore', detached: true }).unref();
+            log('tray helper started (Windows NotifyIcon)');
+          }
+        } else {
+          const py = path.join(ASSET_DIR, 'tray.py');
+          const sh = path.join(ASSET_DIR, 'tray.sh');
+          if (fs.existsSync(py)) {
+            spawn('python3', [py],
+              { stdio: 'ignore', detached: true, env: { ...process.env, GLM_BRIDGE_HOME: STATE_DIR } }).unref();
+            log('tray helper started (AppIndicator)');
+          } else if (fs.existsSync(sh)) {
+            spawn('sh', [sh],
+              { stdio: 'ignore', detached: true, env: { ...process.env, GLM_BRIDGE_HOME: STATE_DIR } }).unref();
+            log('tray helper started (sh/yad)');
+          }
         }
       }
     } catch (e) { log('tray start skipped:', e.message); }

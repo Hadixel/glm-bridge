@@ -193,7 +193,7 @@ function Register-9router {
     Invoke-RestMethod "http://127.0.0.1:20128/api/providers/$($have.id)/test" -Method Post -Headers $headers -ContentType 'application/json' -Body '{}' | Out-Null
     Say 'connection present and tested'
   }
-  Say "use model `"$Prefix/GLM-5.3-Flash`" through 9router"
+  Say "use models `"$Prefix/glm-5.3-flash`" and `"$Prefix/glm-5.3`" through 9router"
 }
 
 $has9r = $false
@@ -208,8 +208,9 @@ Say 'done'
 Write-Host ''
 Write-Host "  base URL : http://127.0.0.1:$Port/v1"
 Write-Host "  api key  : $key"
-Write-Host "  model    : GLM-5.3-Flash"
+Write-Host "  models   : glm-5.3-flash, glm-5.3"
 Write-Host ''
+Write-Host '  TUI      : zbridge.cmd'
 Write-Host '  control  : glm-bridge.cmd start|stop|restart|status|logs'
 Write-Host "  health   : curl http://127.0.0.1:$Port/health"
 Write-Host ''

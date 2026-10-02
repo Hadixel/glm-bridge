@@ -18,3 +18,4 @@ tray.pid
 tray.log
 accounts.json
 accounts/
+__pycache__/

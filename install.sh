@@ -47,7 +47,7 @@ else
 fi
 
 # runtime files live next to the checkout; keep symlink targets valid
-for f in glm-bridge.js mint-captcha.js sysblocks.json zbridge.js tray.sh; do
+for f in glm-bridge.js mint-captcha.js sysblocks.json zbridge.js tray.sh tray.py; do
   [ -f "$INSTALL_DIR/$f" ] || die "missing $f in repo"
 done
 

@@ -17,10 +17,15 @@ if [ -f "$PID_FILE" ]; then
   if [ -n "$old" ] && kill -0 "$old" 2>/dev/null; then exit 0; fi
   rm -f "$PID_FILE"
 fi
-
 if [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
   log "no display; tray skipped"
   exit 0
+fi
+
+# Prefer native StatusNotifierItem / AyatanaAppIndicator over DBus (works on GNOME, Ubuntu, KDE, Wayland)
+if [ -f "$STATE_DIR/tray.py" ] && command -v python3 >/dev/null 2>&1; then
+  log "delegating to tray.py (native StatusNotifierItem)"
+  exec python3 "$STATE_DIR/tray.py"
 fi
 if ! command -v yad >/dev/null 2>&1; then
   log "yad missing; tray skipped"
