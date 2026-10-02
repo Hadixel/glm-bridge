@@ -94,6 +94,7 @@ function rotateAccount(reason) {
   a.active = next.name;
   saveAccounts(a);
   credCache = { at: 0, jwt: null };  // pick up the new account's JWT immediately
+  if (client) client.rejectedModels = new Set();  // new account may be entitled to more models
   log(`rotated to account "${next.name}" (${reason}); "${cur.name}" paused until quota resets`);
   if (client) { try { client.child && client.child.kill('SIGHUP'); } catch { /* exit handler respawns */ } }
   return true;
@@ -703,11 +704,16 @@ class ZcodeClient {
         await this.syncAccountConfig();
         if (!this.ready) return { error: { message: 'bridge warming up, retry shortly' } };
       }
+      // Known-rejected models (registry lacks them) go straight to Flash —
+      // otherwise every glm-5.3 request paid a ~10s upstream rejection first.
+      const requestedModel = modelId || 'GLM-5.3-Flash';
+      const effectiveModel = (this.rejectedModels && this.rejectedModels.has(requestedModel))
+        ? 'GLM-5.3-Flash' : requestedModel;
       const params = {
         workspace: { workspacePath: workspace(), workspaceKey: workspace() },
         selection: {
           providerId: 'account:zai-start-plan',
-          modelId: modelId || 'GLM-5.3-Flash',
+          modelId: effectiveModel,
           options: { reasoningLevel: reasoningLevel || 'max' },
         },
         messages: [...systemBlocks, ...messages],
@@ -1182,9 +1188,11 @@ const server = http.createServer(async (req, res) => {
     if (!checkAuth(req)) return sendJson(res, 401, { error: { message: 'invalid api key', type: 'invalid_request_error' } });
 
     if (req.method === 'GET' && url.pathname === '/v1/models') {
-      // One canonical id only: the start plan serves GLM-5.3-Flash, and
-      // 9router imported both casings before as "2 glm5.3 flash".
+      // Distinct ids only (no case-duplicates — those showed up as
+      // "2 glm5.3 flash" on 9router import). glm-5.3 is served via the
+      // rejected-model fallback until an account has it entitled.
       return sendJson(res, 200, { object: 'list', data: [
+        { id: 'glm-5.3', object: 'model', owned_by: 'zcode-start-plan', created: created_ts },
         { id: 'glm-5.3-flash', object: 'model', owned_by: 'zcode-start-plan', created: created_ts },
       ] });
     }

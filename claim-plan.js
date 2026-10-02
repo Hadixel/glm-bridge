@@ -171,7 +171,18 @@ async function mintOnce(browser, attempt) {
       });
       await new Promise(r => setTimeout(r, 2500));
       window.__btnReady = !!document.getElementById('zcode-aliyun-captcha-button');
+      // Desktop parity: the claim flow runs in auto mode = startTracelessVerification
+      // FIRST, button/popup only as fallback. An interactive (button-clicked)
+      // token is what upstream keeps rejecting with 3007.
+      try { if (window.__inst && typeof window.__inst.startTracelessVerification === 'function') window.__inst.startTracelessVerification(); } catch { /* fall back to click below */ }
     });
+    // Wait for the traceless callback before ever touching the button.
+    for (let i = 0; i < 12; i++) {
+      await page.waitForTimeout(1000);
+      const cb = await page.evaluate(() => (window.__cb || []).filter(x => !String(x).startsWith('BIZ:')));
+      if (cb.length) { say('captcha param obtained traceless (attempt ' + attempt + ', ' + (i + 1) + 's)'); return cb[0]; }
+    }
+    say('traceless silent, falling back to button click');
     // Real (trusted) click on the trigger button: this is what reliably
     // opens the captcha popup and fires the callback.
     let clicked = false;
