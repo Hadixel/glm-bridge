@@ -219,6 +219,43 @@ function ensureTokens(background = true) {
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
+// ------------------------------------------------- quota state (loud) ------
+// When upstream 1005s every account, /health and the TUI must SAY so and
+// what to do (claim in the GUI / wait for renewal) instead of looking "up".
+const quotaState = { lastQuotaAt: 0, lastOkAt: 0 };
+const planCache = { at: 0, active: null, endsAt: null, err: null };  // null=unknown
+
+async function refreshPlan() {
+  if (Date.now() - planCache.at < 60_000) return planCache;
+  try {
+    const jwt = loadJwt();
+    const p = '/api/v1/zcode-plan/billing/current?app_version=3.14.4&platform='
+      + `${process.platform}-${process.arch}`;
+    const r = await httpsGet(p, resolvedProxy, 10_000,
+      { authorization: 'Bearer ' + jwt, 'user-agent': 'ZCode/3.14.4' });
+    if (r.status !== 200) throw new Error('HTTP ' + r.status);
+    const j = JSON.parse(r.body);
+    const plans = (j.data && j.data.plans) || [];
+    const now = Math.floor(Date.now() / 1000);
+    const act = plans.find(x => String(x.status || '').toLowerCase() === 'active'
+      && (!Number.isFinite(x.ends_at) || x.ends_at > now));
+    planCache.at = Date.now();
+    planCache.active = !!act;
+    planCache.endsAt = act && Number.isFinite(act.ends_at) ? act.ends_at : null;
+    planCache.err = null;
+  } catch (e) {
+    planCache.at = Date.now();
+    planCache.err = e.message;
+  }
+  return planCache;
+}
+function markQuotaDrained() {
+  if (quotaState.lastQuotaAt < Date.now() - 1000) {
+    quotaState.lastQuotaAt = Date.now();
+    refreshPlan().catch(() => {});  // populate plan info in the background
+  }
+}
+
 // ------------------------------------------------------- connectivity ------
 // The local network may have no direct internet (VPN off), which made every
 // upstream call hang until the CLI gave up. We probe direct first, then fall
@@ -765,6 +802,7 @@ class ZcodeClient {
         if (r.error) {
           const m2 = JSON.stringify(r.error);
           if (/exceed quota|1005/.test(m2)) {
+            markQuotaDrained();
             return { error: { message: 'All ZCode accounts exhausted or plan inactive (upstream code 1005) — run `zbridge` to check accounts/claims.' } };
           }
           return { error: r.error };
@@ -783,6 +821,7 @@ class ZcodeClient {
       }
       // A successful completion proves quota is back: drop the rotation park
       // so this account can be selected again (checked lazily, one read).
+      quotaState.lastOkAt = Date.now();
       try {
         const a = loadAccounts();
         const cur = a.accounts.find(x => x.name === a.active);
@@ -1172,6 +1211,25 @@ const server = http.createServer(async (req, res) => {
         });
       }
       const cliRunning = !!(client.child && client.child.exitCode === null);
+      // Quota awareness: when the bridge has 1005'd since its last success,
+      // say so loudly and tell the user the exact next step. Plan data is
+      // cached; a stale cache triggers a background refresh (never blocks).
+      const drained = quotaState.lastQuotaAt > quotaState.lastOkAt;
+      let action = null;
+      if (drained) {
+        if (planCache.active === false) {
+          action = 'CLAIM NEEDED: open the ZCode desktop app and click Claim on the 100M tokens card'
+            + ' (or run: glm-bridge claim) — the bridge\'s headless claim is blocked by captcha (3007)';
+        } else if (planCache.active && planCache.endsAt) {
+          const mins = Math.max(0, Math.round((planCache.endsAt * 1000 - Date.now()) / 60000));
+          action = `plan active but quota drained — renews in ~${mins} min`
+            + ` (at ${new Date(planCache.endsAt * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })});`
+            + ' if a claim card is offered in the ZCode GUI, claiming it speeds this up';
+        } else {
+          action = 'quota drained — checking plan state; if no plan shows in the ZCode GUI, claim the 100M card there';
+        }
+        if (Date.now() - planCache.at > 60_000) refreshPlan().catch(() => {});
+      }
       return sendJson(res, 200, {
         ok: true,
         ready: !!client.ready,
@@ -1180,6 +1238,9 @@ const server = http.createServer(async (req, res) => {
         credentials: jwtOk,
         account: activeAccount().name,
         accounts: loadAccounts().accounts.length,
+        quota: drained ? 'drained' : 'ok',
+        plan: planCache.active === null ? 'unknown' : (planCache.active ? 'active' : 'missing'),
+        action,
         detail: !cliRunning ? (client.waitReason || 'CLI not running')
           : !jwtOk ? 'CLI running but ZCode credentials missing'
           : client.ready ? null : (client.waitReason || 'CLI up, syncing account config'),
@@ -1616,15 +1677,24 @@ async function ctl() {
   } else if (sub === 'claim') {
     const force = argv.includes('--force');
     const r = await runClaim(force);
+    let captchaBlocked = false;
+    const report = (acct, x) => {
+      const line = x.claimed ? 'claimed' : (x.ok ? (x.reason || 'ok') : 'FAILED ' + (x.detail || ''));
+      console.log(`${acct}: ${line}`);
+      if (!x.claimed && /3007|captcha/i.test(String(x.detail || ''))) captchaBlocked = true;
+    };
     if (r.results) {
-      for (const x of r.results) {
-        console.log(`${x.account}: ${x.claimed ? 'claimed' : (x.ok ? (x.reason || 'ok') : 'FAILED ' + (x.detail || ''))}`);
-      }
+      for (const x of r.results) report(x.account, x);
       if (!r.ok) process.exitCode = 1;
     } else if (r.claimed) console.log('claimed: ' + (r.planId || CLAIM_PLAN));
     else {
-      console.log('not claimed: ' + JSON.stringify(r).slice(0, 400));
+      report('claim', r);
       if (!r.ok) process.exitCode = 1;
+    }
+    if (captchaBlocked) {
+      console.error('\nheadless captcha was rejected (3007). GUI fallback:');
+      console.error('  open the ZCode desktop app → click "Claim" on the 100M tokens card.');
+      console.error('  The bridge picks the plan up automatically within a minute.');
     }
   } else if (sub === 'autostart') {
     console.log(autostartOn() ? 'on' : 'off');
@@ -1717,6 +1787,7 @@ function boot() {
   // within seconds on machines where every probe times out (VPN off etc.).
   getClient();
   resolveProxy(true)
+    .then(() => refreshPlan())          // warm plan cache for /health actions
     .then(() => captchaPolicyRequired())
     .then(req => { if (req) ensureTokens(); })
     .catch(e => log('bootstrap error:', e.message));

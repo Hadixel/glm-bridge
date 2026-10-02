@@ -83,6 +83,15 @@ async function tui() {
     } else {
       console.log('║ bridge : stopped');
     }
+    if (health && health.quota === 'drained') {
+      // Loud, unmissable — this is the "go click Claim in the GUI" signal.
+      console.log('╟──────────────────────────────────────────────────╢');
+      console.log('║ ⚠ QUOTA DRAINED — bridge cannot serve requests   ║');
+      if (health.action) {
+        for (const line of wrap(health.action, 48)) console.log(`║ ⚠ ${line.padEnd(48)} ║`);
+      }
+      if (health.plan) console.log(('║   plan: ' + health.plan).padEnd(49) + '║');
+    }
     console.log('╟──────────────────────────────────────────────────╢');
     console.log('║ 1) start   2) stop    3) restart   4) status      ║');
     console.log('║ 5) accounts (list/switch)                        ║');
@@ -131,6 +140,17 @@ async function tui() {
 }
 
 async function pause(ask) { await ask('press enter…'); }
+
+function wrap(s, width) {
+  const out = [];
+  let line = '';
+  for (const w of String(s).split(' ')) {
+    if ((line + ' ' + w).trim().length > width) { out.push(line.trim()); line = w; }
+    else line += ' ' + w;
+  }
+  if (line.trim()) out.push(line.trim());
+  return out;
+}
 
 async function fetchHealth() {
   let port = 3010;
