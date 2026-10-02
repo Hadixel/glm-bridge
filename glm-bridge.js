@@ -1478,7 +1478,7 @@ function startTray() {
   if (IS_WIN) {
     const ps1 = path.join(ASSET_DIR, 'tray.ps1');
     if (!fs.existsSync(ps1)) { console.error('tray.ps1 missing'); process.exitCode = 1; return; }
-    spawn('powershell', ['-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', ps1],
+    spawn('powershell', ['-STA', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', ps1],
       { stdio: 'ignore', detached: true }).unref();
     console.log('tray started (Windows NotifyIcon)');
     return;
@@ -1810,7 +1810,7 @@ function boot() {
         if (IS_WIN) {
           const ps1 = path.join(ASSET_DIR, 'tray.ps1');
           if (fs.existsSync(ps1)) {
-            spawn('powershell', ['-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', ps1],
+            spawn('powershell', ['-STA', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', ps1],
               { stdio: 'ignore', detached: true }).unref();
             log('tray helper started (Windows NotifyIcon)');
           }

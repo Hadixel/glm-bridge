@@ -17,10 +17,14 @@ $script:ShimCmd = Join-Path $StateDir 'glm-bridge.cmd'
 function Invoke-Glm([string]$Arg) {
     try {
         if ($script:NodeExe -and (Test-Path $script:BridgeJs)) {
-            $p = Start-Process -FilePath $script:NodeExe.Source -ArgumentList "`"$($script:BridgeJs)`"", $Arg -NoNewWindow -Wait -PassThru -RedirectStandardOutput (Join-Path $env:TEMP "glm-out.tmp") -RedirectStandardError (Join-Path $env:TEMP "glm-err.tmp")
-            $res = if (Test-Path (Join-Path $env:TEMP "glm-out.tmp")) { (Get-Content (Join-Path $env:TEMP "glm-out.tmp") -Raw).Trim() } else { '' }
-            Remove-Item (Join-Path $env:TEMP "glm-*.tmp") -Force -ErrorAction SilentlyContinue
-            return $res
+            $tmpOut = [System.IO.Path]::GetTempFileName()
+            $tmpErr = [System.IO.Path]::GetTempFileName()
+            try {
+                $p = Start-Process -FilePath $script:NodeExe.Source -ArgumentList "`"$($script:BridgeJs)`"", $Arg -NoNewWindow -Wait -PassThru -RedirectStandardOutput $tmpOut -RedirectStandardError $tmpErr
+                return if (Test-Path $tmpOut) { (Get-Content $tmpOut -Raw).Trim() } else { '' }
+            } finally {
+                Remove-Item $tmpOut, $tmpErr -Force -ErrorAction SilentlyContinue
+            }
         }
         $cli = Get-Command glm-bridge -ErrorAction SilentlyContinue
         if ($cli) { return (& $cli.Source $Arg 2>$null | Out-String).Trim() }
