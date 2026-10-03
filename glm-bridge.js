@@ -2053,43 +2053,84 @@ async function cliLogin(name) {
   console.log(`================================================================================\n`);
   console.log(`Starting login helper...`);
 
-  await new Promise(resolve => {
-    const p = spawn(process.execPath, [cli, 'login'], { env, stdio: ['inherit', 'pipe', 'pipe'] });
-    let urlFound = false;
+  // Retry loop: the OAuth init POST to chat.z.ai intermittently fails when
+  // egress flaps ("Error: fetch failed") — the child exits before printing
+  // any URL. Retry up to 3 times before giving up.
+  const loginStartedAt = Date.now();
+  let loginCode = 1;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    if (attempt > 1) {
+      console.log(`\nretrying login (attempt ${attempt}/3) in 3s...`);
+      await new Promise(r => setTimeout(r, 3000));
+    }
+    loginCode = await new Promise(resolve => {
+      const p = spawn(process.execPath, [cli, 'login'], { env, stdio: ['inherit', 'pipe', 'pipe'] });
+      let urlFound = false;
 
-    const onData = (chunk) => {
-      const text = chunk.toString();
-      const urlMatch = text.match(/https:\/\/chat\.z\.ai\/api\/oauth\/authorize\S+/);
-      if (urlMatch && !urlFound) {
-        urlFound = true;
-        const authUrl = urlMatch[0];
-        console.log(`\n┌────────────────────────────────────────────────────────────────────────┐`);
-        console.log(`│  AUTHORIZATION LINK:                                                   │`);
-        console.log(`│                                                                        │`);
-        console.log(`│  ${authUrl}`);
-        console.log(`│                                                                        │`);
-        console.log(`│  ★ TO LINK A SECOND / DIFFERENT ACCOUNT:                               │`);
-        console.log(`│    Open this link in a PRIVATE / INCOGNITO browser window so you can   │`);
-        console.log(`│    sign in with a DIFFERENT phone number / account!                    │`);
-        console.log(`└────────────────────────────────────────────────────────────────────────┘\n`);
-        console.log(`Waiting for sign-in completion in browser (or Ctrl+C to cancel)...\n`);
-      } else if (!urlFound) {
-        process.stdout.write(text);
-      }
-    };
+      const onData = (chunk) => {
+        const text = chunk.toString();
+        const urlMatch = text.match(/https:\/\/chat\.z\.ai\/api\/oauth\/authorize\S+/);
+        if (urlMatch && !urlFound) {
+          urlFound = true;
+          const authUrl = urlMatch[0];
+          console.log(`\n┌────────────────────────────────────────────────────────────────────────┐`);
+          console.log(`│  AUTHORIZATION LINK:                                                   │`);
+          console.log(`│                                                                        │`);
+          console.log(`│  ${authUrl}`);
+          console.log(`│                                                                        │`);
+          console.log(`│  ★ TO LINK A SECOND / DIFFERENT ACCOUNT:                               │`);
+          console.log(`│    Open this link in a PRIVATE / INCOGNITO browser window so you can   │`);
+          console.log(`│    sign in with a DIFFERENT phone number / account!                    │`);
+          console.log(`└────────────────────────────────────────────────────────────────────────┘\n`);
+          console.log(`Waiting for sign-in completion in browser (or Ctrl+C to cancel)...\n`);
+        } else if (!urlFound) {
+          process.stdout.write(text);
+        }
+      };
 
-    p.stdout.on('data', onData);
-    p.stderr.on('data', d => {
-      const s = d.toString();
-      if (!s.includes('ZCode Built-in Provider Config')) process.stderr.write(s);
+      p.stdout.on('data', onData);
+      p.stderr.on('data', d => {
+        const s = d.toString();
+        if (!s.includes('ZCode Built-in Provider Config')) process.stderr.write(s);
+      });
+      p.on('exit', code => resolve(code === 0 ? 0 : 1));
     });
-    p.on('exit', code => { process.exitCode = code === 0 ? 0 : 1; resolve(); });
-  });
+    // Success criteria: fresh credentials written during THIS login attempt.
+    const credFile = accountCredFile(acc);
+    const fresh = fs.existsSync(credFile) && fs.statSync(credFile).mtimeMs >= loginStartedAt;
+    if (fresh) { loginCode = 0; break; }
+    if (loginCode === 0 && !fresh) {
+      console.log('\n⚠ process exited but no fresh credentials were written (stale credentials file present).');
+      loginCode = 1;
+    }
+    // If the URL was shown, do NOT retry — the user may be mid-sign-in; wait
+    // is handled above by the child blocking until completion or Ctrl+C.
+  }
 
-  if (fs.existsSync(accountCredFile(acc))) {
+  if (loginCode === 0 && fs.existsSync(accountCredFile(acc))) {
     credCache.clear();
     clearAccountExhaustion(acc.name);
     console.log(`\n✔ Login successful for "${acc.name}"!`);
+    // Auto-claim: a fresh account only carries the baseline 3M+5M daily plan;
+    // the 100M trust offer is claimable right after signup — mint a captcha
+    // token and claim it headlessly (same route as the GUI button).
+    console.log(`  checking for claimable plan offers...`);
+    try {
+      const { execFile } = require('child_process');
+      const claimScript = path.join(__dirname, 'claim-plan.js');
+      if (fs.existsSync(claimScript)) {
+        await new Promise(resolve => {
+          execFile(process.execPath, [claimScript], {
+            env: { ...process.env, ...proxyEnv(), ZCODE_CREDENTIALS: accountCredFile(acc) },
+            timeout: 180_000,
+          }, (err, stdout) => {
+            const s = String(stdout || '').trim();
+            if (s) console.log(`  claim: ${s}`);
+            resolve();
+          });
+        });
+      }
+    } catch {}
     await refreshAccountPlan(acc).catch(() => {});
     const plan = accountPlans.get(acc.name);
     if (plan && plan.quotaLeft) {
@@ -2101,6 +2142,9 @@ async function cliLogin(name) {
     try {
       await fetch(`http://127.0.0.1:${config.port}/reload`, { method: 'POST', signal: AbortSignal.timeout(1500) });
     } catch {}
+  } else if (loginCode !== 0) {
+    console.log('\n✖ Login failed after 3 attempts (network error or cancelled).');
+    process.exitCode = 1;
   } else {
     console.log('\n✖ Credentials not written — login may have timed out or been cancelled.');
     process.exitCode = 1;
