@@ -1059,7 +1059,7 @@ class ZcodeClient {
         const needsCaptcha = (this.inFlightModel === 'GLM-5.3') || reason === 'captcha-retry';
         let hdrs;
         if (needsCaptcha) {
-          if (!captchaPolicyRequired()) forceCaptchaRequired('GLM-5.3 needs captcha');
+          if (!(await captchaPolicyRequired())) forceCaptchaRequired('GLM-5.3 needs captcha');
           hdrs = await captchaHeader();
         } else {
           hdrs = await captchaHeader();
@@ -1198,8 +1198,13 @@ class ZcodeClient {
       if (r.error && params.selection.modelId !== 'GLM-5.3-Flash') {
         const errText = JSON.stringify(r.error);
         const isQuotaErr = /exceed quota|1005|balance.*empty|insufficient.*quota/i.test(errText);
-        const isRegistryErr = !isQuotaErr
-          && /model|entitle|not\s*(?:found|supported|available)|not_entitled|invalid/i.test(errText);
+        // Concurrency/rate limits are TRANSIENT: never a registry rejection.
+        const isTransient = /concurrency|rate limit|too many|timeout|timed out/i.test(errText);
+        // Registry rejection = the model id itself is unknown/unentitled.
+        // NOTE: "model" appears in every AiSdk error string, so it must not
+        // be part of the match.
+        const isRegistryErr = !isQuotaErr && !isTransient
+          && /entitle|not_found|notfound|not\s*(?:supported|available|registered)|unknown model|invalid model|not_entitled/i.test(errText);
         if (params.selection.modelId === 'GLM-5.3' && (isQuotaErr || isRegistryErr)) {
           if (isRegistryErr && !rejectedModels.has('GLM-5.3')) {
             log(`model GLM-5.3 registry-rejected (${errText.slice(0, 160)}), blacklisting globally`);
