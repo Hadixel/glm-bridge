@@ -177,6 +177,9 @@ class GLMTray:
         self.update_status()
 
     def update_status(self):
+        # Track last label so we can force a panel repaint when it changes:
+        # some AppIndicator panel implementations only re-read XAyatanaLabel
+        # when the icon/status is touched alongside the property update.
         try:
             req = urllib.request.Request(f"http://127.0.0.1:{self.port}/health")
             with urllib.request.urlopen(req, timeout=2) as resp:
@@ -191,10 +194,20 @@ class GLMTray:
                     acc_list = data.get('accountsList') or []
 
                     if quota_left:
-                        try:
-                            self.indicator.set_label(f" {quota_left}", "GLM Bridge Quota")
-                        except Exception:
-                            pass
+                        new_label = f" {quota_left}"
+                        if getattr(self, '_last_label', None) != new_label:
+                            self._last_label = new_label
+                            try:
+                                # Nudge the panel: toggle status so it re-reads
+                                # the label property, then apply the new label.
+                                self.indicator.set_status(AppIndicator.IndicatorStatus.PASSIVE)
+                                self.indicator.set_status(AppIndicator.IndicatorStatus.ACTIVE)
+                            except Exception:
+                                pass
+                            try:
+                                self.indicator.set_label(new_label, "GLM Bridge Quota")
+                            except Exception:
+                                pass
                         mode_str = "Round-Robin" if routing == 'round-robin' else "Fill-First"
                         self.account_item.set_label(f"  {mode_str} ({total} accounts) · Quota: {quota_left}")
                     else:
