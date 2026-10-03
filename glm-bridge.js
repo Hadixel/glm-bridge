@@ -2064,7 +2064,13 @@ async function cliLogin(name) {
       await new Promise(r => setTimeout(r, 3000));
     }
     loginCode = await new Promise(resolve => {
-      const p = spawn(process.execPath, [cli, 'login'], { env, stdio: ['inherit', 'pipe', 'pipe'] });
+      // On Windows the CLI auto-opens the browser via `cmd /c start "" <url>`;
+      // the URL is passed unquoted, so cmd splits it at the first '&' and the
+      // browser opens a param-less authorize URL ("Field required" error).
+      // Use --no-browser there and open the URL ourselves, quoted.
+      const args = [cli, 'login'];
+      if (process.platform === 'win32') args.push('--no-browser');
+      const p = spawn(process.execPath, args, { env, stdio: ['inherit', 'pipe', 'pipe'] });
       let urlFound = false;
 
       const onData = (chunk) => {
@@ -2073,6 +2079,17 @@ async function cliLogin(name) {
         if (urlMatch && !urlFound) {
           urlFound = true;
           const authUrl = urlMatch[0];
+          // Windows-safe auto-open: quote the URL for cmd's `start`.
+          try {
+            if (process.platform === 'win32') {
+              spawn('cmd.exe', ['/c', 'start', '', authUrl], { detached: true, stdio: 'ignore' }).unref();
+            } else if (process.platform === 'darwin') {
+              spawn('open', [authUrl], { detached: true, stdio: 'ignore' }).unref();
+            } else {
+              spawn('xdg-open', [authUrl], { detached: true, stdio: 'ignore' }).unref();
+            }
+            console.log(`Opening your browser...\n`);
+          } catch { /* fall back to manual copy/paste */ }
           console.log(`\n┌────────────────────────────────────────────────────────────────────────┐`);
           console.log(`│  AUTHORIZATION LINK:                                                   │`);
           console.log(`│                                                                        │`);
