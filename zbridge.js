@@ -184,7 +184,13 @@ async function tui() {
         : `${c.yellow}${c.bold}Fill-First (Auto-failover)${c.reset}`;
       console.log(`  ${c.bold}Routing:${c.reset}  ${routingBadge}        ${c.bold}Quota Left:${c.reset} ${quotaBadge}`);
       console.log(`  ${c.bold}Account:${c.reset}  ${c.cyan}${c.bold}★ ${health.account || activeAcc.name}${c.reset} ${c.dim}(${health.accounts || accountsData.accounts.length} registered)${c.reset}`);
-      if (health.quotaSummary) {
+      if (health.modelQuotas && Object.keys(health.modelQuotas).length) {
+        console.log(`  ${c.bold}Models:${c.reset}`);
+        for (const [mName, mData] of Object.entries(health.modelQuotas)) {
+          const mLabel = mData.label || mData.remainingFormatted;
+          console.log(`    ${c.cyan}• ${mName.padEnd(16)}${c.reset} ${c.green}${c.bold}${mLabel}${c.reset}`);
+        }
+      } else if (health.quotaSummary) {
         console.log(`  ${c.bold}Pool:${c.reset}     ${c.dim}${health.quotaSummary}${c.reset}`);
       }
 
@@ -334,8 +340,11 @@ async function tui() {
       console.log(`   ${c.gray}${'─'.repeat(width - 6)}${c.reset}`);
       console.log(`   ${c.bold}Model ID${c.reset}         ${c.bold}Target Engine${c.reset}       ${c.bold}Status${c.reset}`);
       console.log(`   ${c.gray}${'─'.repeat(width - 6)}${c.reset}`);
-      console.log(`   ${c.cyan}glm-5.3-flash${c.reset}    GLM-5.3-Flash       ${c.green}● Native (Start Plan 100M)${c.reset}`);
-      console.log(`   ${c.cyan}glm-5.3${c.reset}          GLM-5.3             ${c.green}● Active (Fast Fallback Alias)${c.reset}`);
+      const mq = health?.modelQuotas || {};
+      const flashQuota = mq['GLM-5.3-Flash']?.label || 'Start Plan 100M';
+      const glmQuota = mq['GLM-5.3']?.label || '3M Daily';
+      console.log(`   ${c.cyan}glm-5.3-flash${c.reset}    GLM-5.3-Flash       ${c.green}● Native (${flashQuota})${c.reset}`);
+      console.log(`   ${c.cyan}glm-5.3${c.reset}          GLM-5.3             ${c.green}● Active (${glmQuota})${c.reset}`);
       console.log(`   ${c.dim}glm-5.2${c.reset}          GLM-5.2             ${c.dim}○ Alias${c.reset}`);
       console.log(`   ${c.dim}glm-5-turbo${c.reset}      GLM-5-Turbo         ${c.dim}○ Alias${c.reset}`);
       console.log('');

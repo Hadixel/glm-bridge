@@ -102,16 +102,25 @@ $script:timer.Add_Tick({
         if ($resp -and $resp.ready) {
             $script:statusItem.Text = '● GLM Bridge (Active)'
             $ql = $resp.quotaLeft
-            if ($ql) {
+            $mq = $resp.modelQuotas
+            if ($mq) {
+                $lines = @()
+                foreach ($prop in $mq.PSObject.Properties) {
+                    $m = $prop.Value
+                    $short = $prop.Name -replace '^GLM-', ''
+                    $lines += "$short`: $($m.label)"
+                }
+                $script:quotaItem.Text = "  $($lines -join ' · ')"
+                $script:quotaItem.Visible = $true
+            } elseif ($ql) {
                 $script:quotaItem.Text = "  Quota Left: $ql"
                 $script:quotaItem.Visible = $true
-                $tip = "GLM Bridge ($ql)"
-                if ($tip.Length -gt 63) { $tip = $tip.Substring(0, 63) }
-                $script:ni.Text = $tip
             } else {
                 $script:quotaItem.Visible = $false
-                $script:ni.Text = 'GLM Bridge'
             }
+            $tip = if ($ql) { "GLM Bridge ($ql)" } else { "GLM Bridge" }
+            if ($tip.Length -gt 63) { $tip = $tip.Substring(0, 63) }
+            $script:ni.Text = $tip
         } else {
             $script:statusItem.Text = '○ GLM Bridge (Stopped)'
             $script:quotaItem.Visible = $false

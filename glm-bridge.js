@@ -405,6 +405,24 @@ async function refreshAccountPlan(acc) {
       };
     });
 
+    const modelQuotas = {};
+    for (const b of activeBalances) {
+      const model = b.show_name || 'GLM';
+      if (!modelQuotas[model]) {
+        modelQuotas[model] = { model, total: 0, used: 0, remaining: 0 };
+      }
+      modelQuotas[model].total += Number(b.total_units) || 0;
+      modelQuotas[model].used += Number(b.used_units) || 0;
+      modelQuotas[model].remaining += Number(b.remaining_units) || 0;
+    }
+    for (const [k, v] of Object.entries(modelQuotas)) {
+      v.percent = v.total > 0 ? Math.round((v.remaining / v.total) * 100) : 0;
+      v.remainingFormatted = formatTokens(v.remaining);
+      v.totalFormatted = formatTokens(v.total);
+      v.label = `${v.remainingFormatted} / ${v.totalFormatted} (${v.percent}%)`;
+    }
+    res.modelQuotas = modelQuotas;
+
     const mainPool = activeBalances.find(b => Number(b.total_units) >= 50_000_000)
       || activeBalances[0];
 
@@ -417,10 +435,10 @@ async function refreshAccountPlan(acc) {
       res.percent = pct;
       res.quotaLeft = `${formatTokens(rem)} (${pct}%)`;
 
-      const parts = res.balances
-        .filter(b => b.remaining > 0)
-        .map(b => `${b.remainingFormatted} ${b.model.replace(/^GLM-/, '')}`);
-      res.quotaSummary = parts.length ? parts.join(' · ') : `${formatTokens(rem)} left`;
+      const modelParts = Object.values(modelQuotas).map(m =>
+        `${m.model.replace(/^GLM-/, '')}: ${m.remainingFormatted}/${m.totalFormatted}`
+      );
+      res.quotaSummary = modelParts.length ? modelParts.join(' · ') : `${formatTokens(rem)} left`;
 
       // Proactive empty detection: if remaining is 0, park until renewal
       if (rem <= 0) {
@@ -465,15 +483,40 @@ async function refreshPlan() {
   planCache.totalTokens = totalCap;
   planCache.percent = totalCap > 0 ? Math.round((totalRemaining / totalCap) * 100) : 0;
   planCache.balances = activePlan ? activePlan.balances : [];
+  const combinedModelQuotas = {};
+  for (const a of allAccounts) {
+    const p = accountPlans.get(a.name);
+    if (p && p.modelQuotas) {
+      for (const [mName, mData] of Object.entries(p.modelQuotas)) {
+        if (!combinedModelQuotas[mName]) {
+          combinedModelQuotas[mName] = { model: mName, total: 0, used: 0, remaining: 0 };
+        }
+        combinedModelQuotas[mName].total += mData.total;
+        combinedModelQuotas[mName].used += mData.used;
+        combinedModelQuotas[mName].remaining += mData.remaining;
+      }
+    }
+  }
+
+  for (const [k, v] of Object.entries(combinedModelQuotas)) {
+    v.percent = v.total > 0 ? Math.round((v.remaining / v.total) * 100) : 0;
+    v.remainingFormatted = formatTokens(v.remaining);
+    v.totalFormatted = formatTokens(v.total);
+    v.label = `${v.remainingFormatted} / ${v.totalFormatted} (${v.percent}%)`;
+  }
+  planCache.modelQuotas = combinedModelQuotas;
+
+  const modelParts = Object.values(combinedModelQuotas).map(m =>
+    `${m.model.replace(/^GLM-/, '')}: ${m.remainingFormatted}/${m.totalFormatted}`
+  );
 
   if (allAccounts.length > 1) {
     planCache.quotaLeft = `${formatTokens(totalRemaining)} (${planCache.percent}%)`;
-    planCache.quotaSummary = summaries.join(' · ');
+    planCache.quotaSummary = modelParts.length ? modelParts.join(' · ') : summaries.join(' · ');
   } else if (activePlan) {
     planCache.quotaLeft = activePlan.quotaLeft;
-    planCache.quotaSummary = activePlan.quotaSummary;
+    planCache.quotaSummary = modelParts.length ? modelParts.join(' · ') : activePlan.quotaSummary;
   }
-
   return planCache;
 }
 function markQuotaDrained() {
@@ -757,6 +800,26 @@ function statesFor(providers) {
   return states;
 }
 
+function ensureStartPlanModels(providers, inner) {
+  const sp = providers['account:zai-start-plan'];
+  if (sp) {
+    const list = Array.isArray(sp.builtinModelIds) ? sp.builtinModelIds : [];
+    if (!list.includes('GLM-5.3')) {
+      sp.builtinModelIds = ['GLM-5.3', ...list.filter(m => m !== 'GLM-5.3')];
+    }
+  }
+  if (inner && Array.isArray(inner[1])) {
+    for (const p of inner[1]) {
+      if (p.providerId === 'account:zai-start-plan' && p.config) {
+        const list = Array.isArray(p.config.builtinModelIds) ? p.config.builtinModelIds : [];
+        if (!list.includes('GLM-5.3')) {
+          p.config.builtinModelIds = ['GLM-5.3', ...list.filter(m => m !== 'GLM-5.3')];
+        }
+      }
+    }
+  }
+}
+
 function loadAccountRevision(builtinFile) {
   const computed = builtinRevisionFor(builtinFile);
   // 1) newest desktop log line (desktop host is the source of truth)
@@ -775,6 +838,7 @@ function loadAccountRevision(builtinFile) {
         const revision = 'account:' + JSON.stringify(inner);
         const providers = {};
         for (const p of inner[1]) providers[p.providerId] = p.config;
+        ensureStartPlanModels(providers, inner);
         const out = { revision, basedOnZCodeBuiltinRevision: computed, providers, states: statesFor(providers) };
         fs.writeFileSync(CACHE_PATH, JSON.stringify(out, null, 2));
         log('account revision parsed from desktop log');
@@ -789,6 +853,7 @@ function loadAccountRevision(builtinFile) {
     const inner = JSON.parse(cached.revision.slice(cached.revision.indexOf(':') + 1));
     inner[0] = computed;
     cached.revision = 'account:' + JSON.stringify(inner);
+    ensureStartPlanModels(cached.providers, inner);
     cached.states = statesFor(cached.providers);
     log('account revision loaded from cache');
     return cached;
@@ -805,6 +870,7 @@ function loadAccountRevision(builtinFile) {
       providers[r.providerId] = { access, builtinModelIds: c.builtinModelIds };
     }
     const inner = [computed, Object.entries(providers).map(([providerId, config]) => ({ providerId, config }))];
+    ensureStartPlanModels(providers, inner);
     const out = { revision: 'account:' + JSON.stringify(inner), basedOnZCodeBuiltinRevision: computed, providers, states: statesFor(providers) };
     fs.writeFileSync(CACHE_PATH, JSON.stringify(out, null, 2));
     log('account revision derived from builtin rules');
@@ -857,7 +923,7 @@ function resolveCliRoot() {
 }
 
 // -------------------------------------------------------- protocol client -----
-const rejectedModels = new Set(['GLM-5.3']);
+const rejectedModels = new Set();
 class ZcodeClient {
   constructor(account = null) {
     this.account = account || activeAccount();
@@ -1040,7 +1106,7 @@ class ZcodeClient {
       // Known-rejected models (registry lacks them) go straight to Flash —
       // otherwise every glm-5.3 request paid a ~10s upstream rejection first.
       const requestedModel = modelId || 'GLM-5.3-Flash';
-      const effectiveModel = (rejectedModels.has(requestedModel) || requestedModel === 'GLM-5.3')
+      const effectiveModel = (rejectedModels.has(requestedModel))
         ? 'GLM-5.3-Flash' : requestedModel;
       const opId = 'op-' + crypto.randomUUID();
       const params = {
@@ -1082,12 +1148,10 @@ class ZcodeClient {
       // GLM-5.3 joined the plan after the desktop last wrote its log). If the
       // upstream rejects the model as unknown/unentitled, retry once on the
       // plan's baseline Flash and remember what worked.
-      if (r.error && params.selection.modelId !== 'GLM-5.3-Flash'
-          && /model|entitle|not\s*(?:found|supported|available)|not_entitled|invalid/i.test(JSON.stringify(r.error))) {
-        if (!rejectedModels.has(params.selection.modelId)) {
-          log(`model ${params.selection.modelId} rejected (${JSON.stringify(r.error).slice(0, 200)}), retrying with GLM-5.3-Flash`);
-          rejectedModels.add(params.selection.modelId);
-        }
+      if (r.error && params.selection.modelId === 'GLM-5.3'
+          && /model|entitle|not\s*(?:found|supported|available)|not_entitled|invalid|1005|exceed quota/i.test(JSON.stringify(r.error))) {
+        log(`model ${params.selection.modelId} rejected or quota exhausted (${JSON.stringify(r.error).slice(0, 200)}), falling back to GLM-5.3-Flash`);
+        rejectedModels.add('GLM-5.3');
         params.selection.modelId = 'GLM-5.3-Flash';
         r = await sendOnce();
       }
@@ -1653,6 +1717,7 @@ const server = http.createServer(async (req, res) => {
         quotaTokens: planCache.remainingTokens ?? null,
         quotaTotal: planCache.totalTokens ?? null,
         quotaDetails: planCache.balances || [],
+        modelQuotas: planCache.modelQuotas || activePlan?.modelQuotas || {},
         plan: planCache.active === null ? 'unknown' : (planCache.active ? 'active' : 'missing'),
         action,
         detail: !cliRunning ? (activeC?.waitReason || 'CLI not running')
@@ -1932,16 +1997,59 @@ async function cliLogin(name) {
     ZCODE_PERSONAL_PROVIDER_CONFIG_FILE: path.join(acc.dir, '.zcode', 'v2', 'provider_config.json'),
   };
   if (builtin) env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE = builtin;
-  console.log(`logging in account "${acc.name}" — open the printed URL in a browser (no ZCode GUI needed)`);
+  console.log(`\n================================================================================`);
+  console.log(`  Logging in Z.AI Account "${acc.name}"`);
+  console.log(`================================================================================\n`);
+  console.log(`Starting login helper...`);
+
   await new Promise(resolve => {
-    const p = spawn(process.execPath, [cli, 'login', '--no-browser'], { env, stdio: 'inherit' });
+    const p = spawn(process.execPath, [cli, 'login'], { env, stdio: ['inherit', 'pipe', 'pipe'] });
+    let urlFound = false;
+
+    const onData = (chunk) => {
+      const text = chunk.toString();
+      const urlMatch = text.match(/https:\/\/chat\.z\.ai\/api\/oauth\/authorize\S+/);
+      if (urlMatch && !urlFound) {
+        urlFound = true;
+        const authUrl = urlMatch[0];
+        console.log(`\n┌────────────────────────────────────────────────────────────────────────┐`);
+        console.log(`│  AUTHORIZATION LINK:                                                   │`);
+        console.log(`│                                                                        │`);
+        console.log(`│  ${authUrl}`);
+        console.log(`│                                                                        │`);
+        console.log(`│  ★ TO LINK A SECOND / DIFFERENT ACCOUNT:                               │`);
+        console.log(`│    Open this link in a PRIVATE / INCOGNITO browser window so you can   │`);
+        console.log(`│    sign in with a DIFFERENT phone number / account!                    │`);
+        console.log(`└────────────────────────────────────────────────────────────────────────┘\n`);
+        console.log(`Waiting for sign-in completion in browser (or Ctrl+C to cancel)...\n`);
+      } else if (!urlFound) {
+        process.stdout.write(text);
+      }
+    };
+
+    p.stdout.on('data', onData);
+    p.stderr.on('data', d => {
+      const s = d.toString();
+      if (!s.includes('ZCode Built-in Provider Config')) process.stderr.write(s);
+    });
     p.on('exit', code => { process.exitCode = code === 0 ? 0 : 1; resolve(); });
   });
+
   if (fs.existsSync(accountCredFile(acc))) {
-    console.log(`login OK for "${acc.name}"`);
-    if (accs.active !== acc.name && name) console.log(`switch with: glm-bridge use ${name}`);
+    credCache.clear();
+    clearAccountExhaustion(acc.name);
+    console.log(`\n✔ Login successful for "${acc.name}"!`);
+    await refreshAccountPlan(acc).catch(() => {});
+    const plan = accountPlans.get(acc.name);
+    if (plan && plan.quotaLeft) {
+      console.log(`  Initial Quota: ${plan.quotaLeft}`);
+    }
+    getClientForAccount(acc); // pre-warm
+    if (accs.active !== acc.name && name) {
+      console.log(`  Switch active account: glm-bridge use ${name}`);
+    }
   } else {
-    console.log('credentials not written — login may have failed or been cancelled');
+    console.log('\n✖ Credentials not written — login may have timed out or been cancelled.');
     process.exitCode = 1;
   }
 }
@@ -1980,7 +2088,7 @@ function useAccount(name) {
   if (!acc) { console.error(`account "${name}" not found (see: glm-bridge accounts)`); process.exitCode = 1; return; }
   if (!fs.existsSync(accountCredFile(acc))) console.warn(`warn: "${name}" has no credentials — run: glm-bridge login ${name}`);
   a.active = name; saveAccounts(a);
-  credCache = { at: 0, jwt: null };
+  credCache.clear();
   console.log(`active account: ${name}`);
 }
 
@@ -2095,6 +2203,12 @@ async function ctl() {
       try {
         const h = await (await fetch(`http://127.0.0.1:${config.port}/health`, { signal: AbortSignal.timeout(3000) })).json();
         console.log(JSON.stringify(h));
+        if (h.modelQuotas && Object.keys(h.modelQuotas).length) {
+          console.log('\nModel Quotas:');
+          for (const [mName, mData] of Object.entries(h.modelQuotas)) {
+            console.log(`  • ${mName.padEnd(16)}: ${mData.label || mData.remainingFormatted}`);
+          }
+        }
       } catch { console.log('health: unreachable'); }
     } else if (!alive) {
       process.exitCode = 1;

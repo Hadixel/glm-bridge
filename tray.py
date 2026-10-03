@@ -144,6 +144,9 @@ class GLMTray:
         self.account_item = Gtk.MenuItem(label="")
         self.account_item.set_sensitive(False)
         self.menu.append(self.account_item)
+        self.models_item = Gtk.MenuItem(label="")
+        self.models_item.set_sensitive(False)
+        self.menu.append(self.models_item)
 
         self.quota_item = Gtk.MenuItem(label="")
         self.quota_item.set_sensitive(False)
@@ -199,6 +202,18 @@ class GLMTray:
                         self.account_item.set_label(f"  Account: {acc} ({total} active) · Quota: {quota}")
                     self.account_item.show()
 
+                    model_quotas = data.get('modelQuotas') or {}
+                    if model_quotas:
+                        m_parts = []
+                        for m_name, m_data in model_quotas.items():
+                            short_name = m_name.replace('GLM-', '')
+                            lbl = m_data.get('label') or m_data.get('remainingFormatted') or ''
+                            m_parts.append(f"{short_name}: {lbl}")
+                        self.models_item.set_label(f"  Models: {' · '.join(m_parts)}")
+                        self.models_item.show()
+                    else:
+                        self.models_item.hide()
+
                     if len(acc_list) > 1:
                         detail_parts = []
                         for a in acc_list:
@@ -219,6 +234,7 @@ class GLMTray:
                     except Exception:
                         pass
                     self.account_item.hide()
+                    self.models_item.hide()
                     self.quota_item.hide()
         except Exception:
             self.title_item.set_label("○ GLM Bridge (Stopped)")
@@ -227,6 +243,7 @@ class GLMTray:
             except Exception:
                 pass
             self.account_item.hide()
+            self.models_item.hide()
             self.quota_item.hide()
         return True  # Keep timer running
 
