@@ -2117,6 +2117,17 @@ async function cliLogin(name) {
     console.log(`  checking for claimable plan offers...`);
     try {
       const { execFile } = require('child_process');
+      // claim-plan.js requires X-Device-Mid (preview returns 3001 without it).
+      // A pure CLI login may not have written telemetry-state.json yet — the
+      // GUI writes it on first API use. Create it with a random UUID if so.
+      const v2Dir = path.join(acc.dir, '.zcode', 'v2');
+      const telemetryFile = path.join(v2Dir, 'telemetry-state.json');
+      if (!fs.existsSync(telemetryFile)) {
+        try { fs.mkdirSync(v2Dir, { recursive: true }); } catch {}
+        const mid = crypto.randomUUID();
+        fs.writeFileSync(telemetryFile, JSON.stringify({ deviceMid: mid }, null, 2));
+        log(`generated deviceMid ${mid} for "${acc.name}"`);
+      }
       const claimScript = path.join(__dirname, 'claim-plan.js');
       if (fs.existsSync(claimScript)) {
         await new Promise(resolve => {
