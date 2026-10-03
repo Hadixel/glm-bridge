@@ -825,6 +825,7 @@ function loadAccountRevision(builtinFile) {
   // 1) newest desktop log line (desktop host is the source of truth)
   try {
     const logDir = path.join(zcodeDir(), 'v2', 'logs');
+    if (!fs.existsSync(logDir)) throw new Error('logs dir does not exist');
     const files = fs.readdirSync(logDir).filter(f => f.endsWith('.log')).sort().reverse();
     for (const f of files) {
       const txt = fs.readFileSync(path.join(logDir, f), 'utf8');
@@ -1725,6 +1726,11 @@ const server = http.createServer(async (req, res) => {
           : (anyReady || activeC?.ready) ? null : (activeC?.waitReason || 'CLI up, syncing account config'),
       });
     }
+    if (req.method === 'POST' && url.pathname === '/reload') {
+      warmClientPool();
+      refreshPlan().catch(() => {});
+      return sendJson(res, 200, { ok: true, accounts: loadAccounts().accounts.length });
+    }
     if (!checkAuth(req)) return sendJson(res, 401, { error: { message: 'invalid api key', type: 'invalid_request_error' } });
 
     if (req.method === 'GET' && url.pathname === '/v1/models') {
@@ -2044,10 +2050,12 @@ async function cliLogin(name) {
     if (plan && plan.quotaLeft) {
       console.log(`  Initial Quota: ${plan.quotaLeft}`);
     }
-    getClientForAccount(acc); // pre-warm
     if (accs.active !== acc.name && name) {
       console.log(`  Switch active account: glm-bridge use ${name}`);
     }
+    try {
+      await fetch(`http://127.0.0.1:${config.port}/reload`, { method: 'POST', signal: AbortSignal.timeout(1500) });
+    } catch {}
   } else {
     console.log('\n✖ Credentials not written — login may have timed out or been cancelled.');
     process.exitCode = 1;
