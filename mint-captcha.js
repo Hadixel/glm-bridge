@@ -16,10 +16,63 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { execFileSync } = require('child_process');
+
+function getSystemProxy() {
+  const envProxy = process.env.GLM_BRIDGE_PROXY
+    || process.env.HTTPS_PROXY || process.env.https_proxy
+    || process.env.ALL_PROXY || process.env.all_proxy
+    || process.env.HTTP_PROXY || process.env.http_proxy;
+  if (envProxy) return envProxy;
+  if (process.platform === 'linux') {
+    try {
+      const mode = execFileSync('gsettings', ['get', 'org.gnome.system.proxy', 'mode'],
+        { encoding: 'utf8', timeout: 800, stdio: ['ignore', 'pipe', 'ignore'] }).trim().replace(/'/g, '');
+      if (mode === 'manual') {
+        const host = execFileSync('gsettings', ['get', 'org.gnome.system.proxy.http', 'host'],
+          { encoding: 'utf8', timeout: 800, stdio: ['ignore', 'pipe', 'ignore'] }).trim().replace(/'/g, '');
+        const port = execFileSync('gsettings', ['get', 'org.gnome.system.proxy.http', 'port'],
+          { encoding: 'utf8', timeout: 800, stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+        if (host && port && port !== '0') return `http://${host}:${port}`;
+        const socksHost = execFileSync('gsettings', ['get', 'org.gnome.system.proxy.socks', 'host'],
+          { encoding: 'utf8', timeout: 800, stdio: ['ignore', 'pipe', 'ignore'] }).trim().replace(/'/g, '');
+        const socksPort = execFileSync('gsettings', ['get', 'org.gnome.system.proxy.socks', 'port'],
+          { encoding: 'utf8', timeout: 800, stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+        if (socksHost && socksPort && socksPort !== '0') return `socks5://${socksHost}:${socksPort}`;
+      }
+    } catch {}
+  } else if (process.platform === 'win32') {
+    try {
+      const out = execFileSync('reg', ['query', 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings', '/v', 'ProxyServer'],
+        { encoding: 'utf8', timeout: 1000, stdio: ['ignore', 'pipe', 'ignore'] });
+      const m = out.match(/ProxyServer\s+REG_SZ\s+(\S+)/);
+      if (m && m[1]) {
+        const server = m[1];
+        return server.includes('://') ? server : `http://${server}`;
+      }
+    } catch {}
+  } else if (process.platform === 'darwin') {
+    try {
+      const out = execFileSync('scutil', ['--proxy'],
+        { encoding: 'utf8', timeout: 1000, stdio: ['ignore', 'pipe', 'ignore'] });
+      const httpEnabled = /HTTPEnable\s*:\s*1/.test(out);
+      const hostMatch = out.match(/HTTPProxy\s*:\s*(\S+)/);
+      const portMatch = out.match(/HTTPPort\s*:\s*(\d+)/);
+      if (httpEnabled && hostMatch && portMatch) {
+        return `http://${hostMatch[1]}:${portMatch[1]}`;
+      }
+    } catch {}
+  }
+  return null;
+}
 
 const COUNT = parseInt(process.argv[2] || process.env.COUNT || '10', 10);
 const OUT = process.argv[3] || path.join(__dirname, 'tokens-minted.json');
-const PROXY = process.argv[4] || process.env.MINT_PROXY || '';
+const PROXY = process.argv[4] || process.env.MINT_PROXY || process.env.GLM_BRIDGE_PROXY
+  || process.env.HTTPS_PROXY || process.env.https_proxy
+  || process.env.ALL_PROXY || process.env.all_proxy
+  || process.env.HTTP_PROXY || process.env.http_proxy
+  || getSystemProxy() || '';
 const SCENE_ID = process.env.ZCODE_CAPTCHA_SCENE || '11xygtvd';
 const PREFIX = process.env.ZCODE_CAPTCHA_PREFIX || 'no8xfe';
 const REGION = process.env.ZCODE_CAPTCHA_REGION || 'sgp';
@@ -75,7 +128,7 @@ function findChromium() {
       try { all = fs.readdirSync(root).filter(d => /^chromium/.test(d)).sort().reverse(); } catch { continue; }
       // Prefer full Chromium: the Aliyun SDK does not complete inside
       // chrome-headless-shell (the callback never fires).
-      const dirs = [
+      dirs = [
         ...all.filter(d => !d.includes('headless_shell')),
         ...all.filter(d => d.includes('headless_shell')),
       ];

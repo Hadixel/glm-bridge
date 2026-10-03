@@ -57,7 +57,25 @@ function loadAccounts() {
   if (!a || !Array.isArray(a.accounts) || !a.accounts.length) {
     a = { active: 'main', accounts: [{ name: 'main', dir: HOME, addedAt: Date.now() }] };
   }
-  if (!a.accounts.some(x => x.name === a.active)) a.active = a.accounts[0].name;
+  const now = Date.now();
+  let changed = false;
+  for (const acc of a.accounts) {
+    if (acc.exhaustedUntil && acc.exhaustedUntil <= now) {
+      delete acc.exhaustedUntil;
+      changed = true;
+    }
+    if (acc.quotaEmptyUntil && acc.quotaEmptyUntil <= now) {
+      delete acc.quotaEmptyUntil;
+      changed = true;
+    }
+  }
+  if (!a.accounts.some(x => x.name === a.active)) {
+    a.active = a.accounts[0].name;
+    changed = true;
+  }
+  if (changed) {
+    try { saveAccounts(a); } catch {}
+  }
   return a;
 }
 function saveAccounts(a) { fs.writeFileSync(ACCOUNTS_PATH, JSON.stringify(a, null, 2)); }
@@ -65,14 +83,48 @@ function activeAccount() {
   const a = loadAccounts();
   return a.accounts.find(x => x.name === a.active) || a.accounts[0];
 }
-function accountCredFile(acc) { return path.join(acc.dir, '.zcode', 'v2', 'credentials.json'); }
-// Called when the upstream reports quota exhausted (1005): park the active
-// account for 24 h and move to another logged-in account, so each account's
-// own 100M/day plan gets used in turn. Returns true when a live child is now
-// bound to a different account (caller retries its request once).
-// Park an exhausted account only until the next daily renewal (CLAIM_AT,
-// default 19:30 local): the plan re-grants 100M then, so a flat 24h park
-// would wrongly skip a renewed account for hours.
+function accountCredFile(acc) {
+  const dir = acc ? acc.dir : activeAccount().dir;
+  return path.join(dir, '.zcode', 'v2', 'credentials.json');
+}
+function getUsableAccounts() {
+  const a = loadAccounts();
+  const now = Date.now();
+  return a.accounts.filter(x => {
+    if (!fs.existsSync(accountCredFile(x))) return false;
+    if (x.exhaustedUntil && x.exhaustedUntil > now) return false;
+    if (x.quotaEmptyUntil && x.quotaEmptyUntil > now) return false;
+    return true;
+  });
+}
+function markAccountExhausted(name, reason) {
+  const a = loadAccounts();
+  const acc = a.accounts.find(x => x.name === name);
+  if (!acc) return;
+  acc.exhaustedUntil = nextRenewalMs();
+  saveAccounts(a);
+  log(`account "${name}" paused until daily quota resets (${reason})`);
+}
+function markAccountEmpty(name, reason) {
+  const a = loadAccounts();
+  const acc = a.accounts.find(x => x.name === name);
+  if (!acc) return;
+  acc.quotaEmptyUntil = nextRenewalMs();
+  saveAccounts(a);
+  log(`account "${name}" marked empty until renewal (${reason})`);
+}
+function clearAccountExhaustion(name) {
+  try {
+    const a = loadAccounts();
+    const acc = a.accounts.find(x => x.name === name);
+    if (acc && (acc.exhaustedUntil || acc.quotaEmptyUntil)) {
+      delete acc.exhaustedUntil;
+      delete acc.quotaEmptyUntil;
+      saveAccounts(a);
+    }
+  } catch {}
+}
+
 function nextRenewalMs() {
   const parts = String(process.env.GLM_BRIDGE_CLAIM_AT || '19:30').split(':');
   const hh = Number.isFinite(Number(parts[0])) ? Number(parts[0]) : 19;
@@ -85,24 +137,22 @@ function nextRenewalMs() {
 function rotateAccount(reason) {
   const a = loadAccounts();
   const cur = a.accounts.find(x => x.name === a.active);
-  if (!cur) return false;
-  cur.exhaustedUntil = nextRenewalMs();
-  const next = a.accounts.find(x =>
-    x.name !== cur.name && fs.existsSync(accountCredFile(x)) &&
-    !(x.exhaustedUntil && x.exhaustedUntil > Date.now()));
-  if (!next) { saveAccounts(a); log(`quota exhausted (${reason}) and no other account is usable`); return false; }
-  a.active = next.name;
+  if (cur) cur.exhaustedUntil = nextRenewalMs();
+  const usable = getUsableAccounts().filter(x => x.name !== (cur ? cur.name : ''));
+  if (!usable.length) {
+    saveAccounts(a);
+    log(`quota exhausted (${reason}) and no other account is usable`);
+    return false;
+  }
+  a.active = usable[0].name;
   saveAccounts(a);
-  credCache = { at: 0, jwt: null };  // pick up the new account's JWT immediately
-  if (client) client.rejectedModels = new Set();  // new account may be entitled to more models
-  log(`rotated to account "${next.name}" (${reason}); "${cur.name}" paused until quota resets`);
-  if (client) { try { client.child && client.child.kill('SIGHUP'); } catch { /* exit handler respawns */ } }
+  log(`rotated active account to "${usable[0].name}" (${reason})`);
   return true;
 }
 // ZCode keeps its CLI data in <dataBaseDir>/.zcode on every platform
-const zcodeDir = () => path.join(activeAccount().dir, '.zcode');
-const credPath = () => path.join(zcodeDir(), 'v2', 'credentials.json');
-const workspace = () => path.join(zcodeDir(), 'workspace', 'default');
+const zcodeDir = (acc) => path.join((acc || activeAccount()).dir, '.zcode');
+const credPath = (acc) => path.join(zcodeDir(acc), 'v2', 'credentials.json');
+const workspace = (acc) => path.join(STATE_DIR, 'workspace', (acc || activeAccount()).name);
 const MINT_SCRIPT = path.join(ASSET_DIR, 'mint-captcha.js');
 const SYSBLOCKS_PATH = path.join(ASSET_DIR, 'sysblocks.json');
 const APPIMAGE = (() => {
@@ -136,7 +186,7 @@ function log(...a) {
   if (process.env.GLM_BRIDGE_QUIET !== '1') process.stdout.write(line);
 }
 
-const config = (() => {
+function loadConfig() {
   let c = {};
   try { c = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8')); } catch { /* first run */ }
   if (!c.key) {
@@ -146,8 +196,27 @@ const config = (() => {
   }
   c.port = Number(process.env.GLM_BRIDGE_PORT || c.port || 3010);
   if (process.env.GLM_BRIDGE_KEY) c.key = process.env.GLM_BRIDGE_KEY;
+  c.routing = process.env.GLM_BRIDGE_ROUTING || c.routing || 'round-robin';
   return c;
-})();
+}
+function saveConfig(c) {
+  fs.writeFileSync(CONFIG_PATH, JSON.stringify(c, null, 2));
+}
+function getRoutingMode() {
+  const cfg = loadConfig();
+  return process.env.GLM_BRIDGE_ROUTING || cfg.routing || 'round-robin';
+}
+function setRoutingMode(mode) {
+  if (!['round-robin', 'fill-first'].includes(mode)) {
+    throw new Error('Routing mode must be "round-robin" or "fill-first"');
+  }
+  const cfg = loadConfig();
+  cfg.routing = mode;
+  saveConfig(cfg);
+  log(`routing mode set to: ${mode}`);
+  return mode;
+}
+const config = loadConfig();
 
 // ------------------------------------------------------------- credentials ---
 // ZCode stores credentials as enc:v1:<iv>.<tag>.<ct> (AES-256-GCM, base64url),
@@ -164,13 +233,21 @@ function decryptCredential(blob) {
   return Buffer.concat([d.update(b(ctB)), d.final()]).toString('utf8');
 }
 
-let credCache = { at: 0, jwt: null };
-function loadJwt() {
-  if (Date.now() - credCache.at < 60_000 && credCache.jwt) return credCache.jwt;
-  const raw = JSON.parse(fs.readFileSync(credPath(), 'utf8'));
-  const jwt = decryptCredential(raw['zcodejwttoken']);
-  credCache = { at: Date.now(), jwt };
-  return jwt;
+const credCache = new Map();
+function loadJwt(acc) {
+  if (!acc) acc = activeAccount();
+  const cached = credCache.get(acc.name);
+  if (cached && Date.now() - cached.at < 60_000 && cached.jwt) return cached.jwt;
+  const file = accountCredFile(acc);
+  if (!fs.existsSync(file)) return null;
+  try {
+    const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const jwt = decryptCredential(raw['zcodejwttoken']);
+    credCache.set(acc.name, { at: Date.now(), jwt });
+    return jwt;
+  } catch (e) {
+    return null;
+  }
 }
 
 // ----------------------------------------------------------- captcha mint ----
@@ -223,30 +300,180 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 // When upstream 1005s every account, /health and the TUI must SAY so and
 // what to do (claim in the GUI / wait for renewal) instead of looking "up".
 const quotaState = { lastQuotaAt: 0, lastOkAt: 0 };
-const planCache = { at: 0, active: null, endsAt: null, err: null };  // null=unknown
+const planCache = {
+  at: 0,
+  active: null,
+  endsAt: null,
+  err: null,
+  quotaLeft: null,
+  quotaSummary: null,
+  percent: null,
+  remainingTokens: 0,
+  totalTokens: 0,
+  balances: [],
+};
 
-async function refreshPlan() {
-  if (Date.now() - planCache.at < 60_000) return planCache;
+function formatTokens(n) {
+  if (typeof n !== 'number' || !Number.isFinite(n) || n < 0) return '0';
+  if (n >= 1_000_000_000) return (n / 1_000_000_000).toFixed(1).replace(/\.0$/, '') + 'B';
+  if (n >= 1_000_000) return (n / 1_000_000).toFixed(1).replace(/\.0$/, '') + 'M';
+  if (n >= 1_000) return (n / 1_000).toFixed(1).replace(/\.0$/, '') + 'k';
+  return String(Math.round(n));
+}
+
+function getTelemetryMid(acc) {
   try {
-    const jwt = loadJwt();
-    const p = '/api/v1/zcode-plan/billing/current?app_version=3.14.4&platform='
+    const dir = acc ? acc.dir : activeAccount().dir;
+    const p = path.join(dir, '.zcode', 'v2', 'telemetry-state.json');
+    const mid = JSON.parse(fs.readFileSync(p, 'utf8')).deviceMid;
+    return typeof mid === 'string' && mid ? mid : '';
+  } catch { return ''; }
+}
+
+const accountPlans = new Map();
+
+async function refreshAccountPlan(acc) {
+  if (!acc) acc = activeAccount();
+  const cached = accountPlans.get(acc.name);
+  if (cached && Date.now() - cached.at < 30_000) return cached;
+
+  const res = {
+    at: Date.now(),
+    name: acc.name,
+    active: false,
+    endsAt: null,
+    err: null,
+    quotaLeft: null,
+    quotaSummary: null,
+    percent: null,
+    remainingTokens: 0,
+    totalTokens: 0,
+    balances: [],
+  };
+
+  try {
+    const jwt = loadJwt(acc);
+    if (!jwt) throw new Error('no credentials');
+    const mid = getTelemetryMid(acc);
+    const headers = {
+      authorization: 'Bearer ' + jwt,
+      'user-agent': 'ZCode/3.14.4',
+      'x-zcode-app-version': '3.14.4',
+      'x-platform': `${process.platform}-${process.arch}`,
+      'x-client-language': 'en-US',
+    };
+    if (mid) headers['x-device-mid'] = mid;
+
+    const balancePath = '/api/v1/zcode-plan/billing/balance?app_version=3.14.4&platform='
       + `${process.platform}-${process.arch}`;
-    const r = await httpsGet(p, resolvedProxy, 10_000,
-      { authorization: 'Bearer ' + jwt, 'user-agent': 'ZCode/3.14.4' });
+    let r = await httpsGet(balancePath, resolvedProxy, 10_000, headers);
+    if (r.status !== 200) {
+      const currentPath = '/api/v1/zcode-plan/billing/current?app_version=3.14.4&platform='
+        + `${process.platform}-${process.arch}`;
+      r = await httpsGet(currentPath, resolvedProxy, 10_000, headers);
+    }
     if (r.status !== 200) throw new Error('HTTP ' + r.status);
     const j = JSON.parse(r.body);
-    const plans = (j.data && j.data.plans) || [];
+    const data = j.data || {};
+    const plans = data.plans || [];
+    const balances = data.balances || [];
     const now = Math.floor(Date.now() / 1000);
+
     const act = plans.find(x => String(x.status || '').toLowerCase() === 'active'
       && (!Number.isFinite(x.ends_at) || x.ends_at > now));
-    planCache.at = Date.now();
-    planCache.active = !!act;
-    planCache.endsAt = act && Number.isFinite(act.ends_at) ? act.ends_at : null;
-    planCache.err = null;
+    res.active = !!act;
+    res.endsAt = act && Number.isFinite(act.ends_at) ? act.ends_at : null;
+
+    const activeBalances = balances.filter(b => {
+      if (b.expires_at && Number.isFinite(b.expires_at) && b.expires_at <= now) return false;
+      return true;
+    });
+
+    res.balances = activeBalances.map(b => {
+      const total = Number(b.total_units) || 0;
+      const used = Number(b.used_units) || 0;
+      const remaining = Number(b.remaining_units) || 0;
+      const pct = total > 0 ? Math.round((remaining / total) * 100) : 0;
+      return {
+        model: b.show_name || 'GLM',
+        total,
+        used,
+        remaining,
+        totalFormatted: formatTokens(total),
+        remainingFormatted: formatTokens(remaining),
+        percent: pct,
+      };
+    });
+
+    const mainPool = activeBalances.find(b => Number(b.total_units) >= 50_000_000)
+      || activeBalances[0];
+
+    if (mainPool) {
+      const rem = Number(mainPool.remaining_units) || 0;
+      const tot = Number(mainPool.total_units) || 0;
+      const pct = tot > 0 ? Math.round((rem / tot) * 100) : 0;
+      res.remainingTokens = rem;
+      res.totalTokens = tot;
+      res.percent = pct;
+      res.quotaLeft = `${formatTokens(rem)} (${pct}%)`;
+
+      const parts = res.balances
+        .filter(b => b.remaining > 0)
+        .map(b => `${b.remainingFormatted} ${b.model.replace(/^GLM-/, '')}`);
+      res.quotaSummary = parts.length ? parts.join(' · ') : `${formatTokens(rem)} left`;
+
+      // Proactive empty detection: if remaining is 0, park until renewal
+      if (rem <= 0) {
+        markAccountEmpty(acc.name, 'balance 0 remaining');
+      } else {
+        clearAccountExhaustion(acc.name);
+      }
+    } else {
+      res.quotaLeft = act ? 'active' : null;
+    }
   } catch (e) {
-    planCache.at = Date.now();
-    planCache.err = e.message;
+    res.err = e.message;
   }
+
+  accountPlans.set(acc.name, res);
+  return res;
+}
+
+async function refreshPlan() {
+  const allAccounts = loadAccounts().accounts.filter(a => fs.existsSync(accountCredFile(a)));
+  for (const a of allAccounts) {
+    await refreshAccountPlan(a).catch(() => {});
+  }
+
+  let totalRemaining = 0;
+  let totalCap = 0;
+  const summaries = [];
+  const activePlan = accountPlans.get(activeAccount().name);
+
+  for (const a of allAccounts) {
+    const p = accountPlans.get(a.name);
+    if (p && !p.err) {
+      totalRemaining += p.remainingTokens;
+      totalCap += p.totalTokens;
+      if (p.quotaLeft) summaries.push(`${a.name}: ${p.quotaLeft}`);
+    }
+  }
+
+  planCache.at = Date.now();
+  planCache.active = allAccounts.some(a => accountPlans.get(a.name)?.active);
+  planCache.remainingTokens = totalRemaining;
+  planCache.totalTokens = totalCap;
+  planCache.percent = totalCap > 0 ? Math.round((totalRemaining / totalCap) * 100) : 0;
+  planCache.balances = activePlan ? activePlan.balances : [];
+
+  if (allAccounts.length > 1) {
+    planCache.quotaLeft = `${formatTokens(totalRemaining)} (${planCache.percent}%)`;
+    planCache.quotaSummary = summaries.join(' · ');
+  } else if (activePlan) {
+    planCache.quotaLeft = activePlan.quotaLeft;
+    planCache.quotaSummary = activePlan.quotaSummary;
+  }
+
   return planCache;
 }
 function markQuotaDrained() {
@@ -261,11 +488,74 @@ function markQuotaDrained() {
 // upstream call hang until the CLI gave up. We probe direct first, then fall
 // back to a local proxy, and give the result to the CLI child via env
 // (Node honours HTTPS_PROXY when --use-env-proxy is on, which we inject).
-const PROXY_CANDIDATES = (process.env.GLM_BRIDGE_PROXY !== undefined
-  ? [process.env.GLM_BRIDGE_PROXY]
-  : ['http://127.0.0.1:10809', 'http://127.0.0.1:7890', 'http://127.0.0.1:8118',
-     'http://127.0.0.1:20171', 'http://127.0.0.1:1080']
-).filter(Boolean);
+function getSystemProxy() {
+  const envProxy = process.env.GLM_BRIDGE_PROXY
+    || process.env.HTTPS_PROXY || process.env.https_proxy
+    || process.env.ALL_PROXY || process.env.all_proxy
+    || process.env.HTTP_PROXY || process.env.http_proxy;
+  if (envProxy) return envProxy;
+
+  if (process.platform === 'linux') {
+    try {
+      const mode = execFileSync('gsettings', ['get', 'org.gnome.system.proxy', 'mode'],
+        { encoding: 'utf8', timeout: 800, stdio: ['ignore', 'pipe', 'ignore'] }).trim().replace(/'/g, '');
+      if (mode === 'manual') {
+        const host = execFileSync('gsettings', ['get', 'org.gnome.system.proxy.http', 'host'],
+          { encoding: 'utf8', timeout: 800, stdio: ['ignore', 'pipe', 'ignore'] }).trim().replace(/'/g, '');
+        const port = execFileSync('gsettings', ['get', 'org.gnome.system.proxy.http', 'port'],
+          { encoding: 'utf8', timeout: 800, stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+        if (host && port && port !== '0') return `http://${host}:${port}`;
+        const socksHost = execFileSync('gsettings', ['get', 'org.gnome.system.proxy.socks', 'host'],
+          { encoding: 'utf8', timeout: 800, stdio: ['ignore', 'pipe', 'ignore'] }).trim().replace(/'/g, '');
+        const socksPort = execFileSync('gsettings', ['get', 'org.gnome.system.proxy.socks', 'port'],
+          { encoding: 'utf8', timeout: 800, stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+        if (socksHost && socksPort && socksPort !== '0') return `socks5://${socksHost}:${socksPort}`;
+      }
+    } catch {}
+  } else if (process.platform === 'win32') {
+    try {
+      const out = execFileSync('reg', ['query', 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings', '/v', 'ProxyServer'],
+        { encoding: 'utf8', timeout: 1000, stdio: ['ignore', 'pipe', 'ignore'] });
+      const m = out.match(/ProxyServer\s+REG_SZ\s+(\S+)/);
+      if (m && m[1]) {
+        const server = m[1];
+        return server.includes('://') ? server : `http://${server}`;
+      }
+    } catch {}
+  } else if (process.platform === 'darwin') {
+    try {
+      const out = execFileSync('scutil', ['--proxy'],
+        { encoding: 'utf8', timeout: 1000, stdio: ['ignore', 'pipe', 'ignore'] });
+      const httpEnabled = /HTTPEnable\s*:\s*1/.test(out);
+      const hostMatch = out.match(/HTTPProxy\s*:\s*(\S+)/);
+      const portMatch = out.match(/HTTPPort\s*:\s*(\d+)/);
+      if (httpEnabled && hostMatch && portMatch) {
+        return `http://${hostMatch[1]}:${portMatch[1]}`;
+      }
+    } catch {}
+  }
+  return null;
+}
+
+function getProxyCandidates() {
+  if (process.env.GLM_BRIDGE_PROXY !== undefined) {
+    return [process.env.GLM_BRIDGE_PROXY].filter(Boolean);
+  }
+  const cands = [];
+  const sys = getSystemProxy();
+  if (sys) cands.push(sys);
+  const envProxies = [
+    process.env.HTTPS_PROXY, process.env.https_proxy,
+    process.env.ALL_PROXY, process.env.all_proxy,
+    process.env.HTTP_PROXY, process.env.http_proxy,
+  ].filter(Boolean);
+  cands.push(...envProxies);
+  cands.push(
+    'http://127.0.0.1:10809', 'http://127.0.0.1:7890', 'http://127.0.0.1:8118',
+    'http://127.0.0.1:20171', 'http://127.0.0.1:10808', 'http://127.0.0.1:1080'
+  );
+  return [...new Set(cands)];
+}
 const PROBE_HOST = 'zcode.z.ai';
 const PROBE_PATH = '/api/v1/zcode-plan/billing/current?app_version=3.14.4';
 let resolvedProxy;      // undefined = unprobed, null = direct, string = proxy url
@@ -300,7 +590,7 @@ async function resolveProxy(force = false) {
     resolvedProxyAt = Date.now();
     return resolvedProxy;
   }
-  for (const p of PROXY_CANDIDATES) {
+  for (const p of getProxyCandidates()) {
     const r = await httpsGet(PROBE_PATH, p).catch(() => ({ status: 0 }));
     if (r.status >= 200 && r.status < 500) {
       log(`connectivity: direct blocked, using proxy ${p} (upstream ${r.status})`);
@@ -567,8 +857,10 @@ function resolveCliRoot() {
 }
 
 // -------------------------------------------------------- protocol client -----
+const rejectedModels = new Set(['GLM-5.3']);
 class ZcodeClient {
-  constructor() {
+  constructor(account = null) {
+    this.account = account || activeAccount();
     this.child = null;
     this.ready = false;
     this.id = 0;
@@ -594,21 +886,24 @@ class ZcodeClient {
       return;
     }
     this.waitReason = null;
-    const acc = activeAccount();
+    const acc = this.account || activeAccount();
+    this.account = acc;
+    const accZcodeDir = path.join(acc.dir, '.zcode');
+    const ws = workspace(acc);
     const env = {
       ...process.env,
       ...proxyEnv(),
       // Per-account data root: the child resolves <dir>/.zcode/... itself.
       ZCODE_DATA_BASE_DIR: acc.dir,
       ZCODE_BUILTIN_PROVIDER_CONFIG_FILE: builtinFile,
-      ZCODE_PERSONAL_PROVIDER_CONFIG_FILE: path.join(zcodeDir(), 'v2', 'provider_config.json'),
+      ZCODE_PERSONAL_PROVIDER_CONFIG_FILE: path.join(accZcodeDir, 'v2', 'provider_config.json'),
     };
-    try { fs.mkdirSync(workspace(), { recursive: true }); } catch { /* cwd below may exist */ }
+    try { fs.mkdirSync(ws, { recursive: true }); } catch { /* cwd below may exist */ }
     log('spawning CLI:', cli, '| builtin:', builtinFile, '| account:', acc.name);
     this.lastStderr = null;
     this.waitReason = 'spawning CLI';
     this.child = spawn(process.execPath, [cli, 'app-server', '--stdio', '--surface', 'terminal'], {
-      cwd: workspace(), env, stdio: ['pipe', 'pipe', 'pipe'],
+      cwd: ws, env, stdio: ['pipe', 'pipe', 'pipe'],
     });
     this.builtinFile = builtinFile;
     this.ready = false;
@@ -671,9 +966,9 @@ class ZcodeClient {
           result = { headersApplied: false, errorMessage: 'captcha token pool exhausted' };
           log('captcha required but pool empty; refusing header request');
         } else {
-          const jwt = loadJwt();
+          const jwt = loadJwt(this.account);
           result = { headersApplied: true, requestAuth: { apiKey: jwt, headers: hdrs } };
-          log(`runtime headers applied (reason=${(m.params || {}).reason}, captcha=${Object.keys(hdrs).length ? 'token' : 'none'}, pool=${tokens.length})`);
+          log(`runtime headers applied (acc=${this.account ? this.account.name : 'default'}, reason=${(m.params || {}).reason}, captcha=${Object.keys(hdrs).length ? 'token' : 'none'}, pool=${tokens.length})`);
         }
       } else {
         log('unhandled server request', m.method, JSON.stringify(m.params || {}).slice(0, 200));
@@ -734,20 +1029,23 @@ class ZcodeClient {
   }
 
   // Serialize upstream calls: Aliyun captcha can reject duplicate concurrent submits.
-  generate({ systemBlocks, messages, tools, maxOutputTokens, reasoningLevel, modelId }) {
+  generate({ systemBlocks, messages, tools, maxOutputTokens, reasoningLevel, modelId, signal }) {
     const run = async () => {
       if (!this.ready) {
         // one nudge in case sync is lagging
         await this.syncAccountConfig();
         if (!this.ready) return { error: { message: 'bridge warming up, retry shortly' } };
       }
+      if (signal && signal.aborted) return { error: { message: 'request aborted by client' } };
       // Known-rejected models (registry lacks them) go straight to Flash —
       // otherwise every glm-5.3 request paid a ~10s upstream rejection first.
       const requestedModel = modelId || 'GLM-5.3-Flash';
-      const effectiveModel = (this.rejectedModels && this.rejectedModels.has(requestedModel))
+      const effectiveModel = (rejectedModels.has(requestedModel) || requestedModel === 'GLM-5.3')
         ? 'GLM-5.3-Flash' : requestedModel;
+      const opId = 'op-' + crypto.randomUUID();
       const params = {
-        workspace: { workspacePath: workspace(), workspaceKey: workspace() },
+        operationId: opId,
+        workspace: { workspacePath: workspace(this.account), workspaceKey: workspace(this.account) },
         selection: {
           providerId: 'account:zai-start-plan',
           modelId: effectiveModel,
@@ -758,8 +1056,21 @@ class ZcodeClient {
         maxOutputTokens,
       };
       if (tools && tools.length) params.tools = tools;
+      let onAbort = null;
+      if (signal) {
+        onAbort = () => {
+          this.send('workspace/cancelGenerateText', { operationId: opId }).catch(() => {});
+        };
+        signal.addEventListener('abort', onAbort, { once: true });
+      }
       const sendOnce = () => this.send('workspace/generateText', params, 300_000);
-      let r = await sendOnce();
+      let r;
+      try {
+        r = await sendOnce();
+      } finally {
+        if (signal && onAbort) signal.removeEventListener('abort', onAbort);
+      }
+      if (signal && signal.aborted) return { error: { message: 'request aborted by client' } };
       // If the upstream starts demanding captcha tokens again, recover on the
       // spot instead of failing the request: flip the policy and retry once.
       if (r.error && /3012|unusual activity|captcha/i.test(JSON.stringify(r.error))) {
@@ -773,40 +1084,18 @@ class ZcodeClient {
       // plan's baseline Flash and remember what worked.
       if (r.error && params.selection.modelId !== 'GLM-5.3-Flash'
           && /model|entitle|not\s*(?:found|supported|available)|not_entitled|invalid/i.test(JSON.stringify(r.error))) {
-        this.rejectedModels = this.rejectedModels || new Set();
-        if (!this.rejectedModels.has(params.selection.modelId)) {
+        if (!rejectedModels.has(params.selection.modelId)) {
           log(`model ${params.selection.modelId} rejected (${JSON.stringify(r.error).slice(0, 200)}), retrying with GLM-5.3-Flash`);
-          this.rejectedModels.add(params.selection.modelId);
+          rejectedModels.add(params.selection.modelId);
         }
         params.selection.modelId = 'GLM-5.3-Flash';
         r = await sendOnce();
       }
       if (r.error) {
         const msg = JSON.stringify(r.error);
-        log('generateText error (req=' + requestedModel + ' eff=' + effectiveModel + '):', msg.slice(0, 3000));
-        // code 1005 = this account's plan is exhausted (or inactive). Park it
-        // and retry once on the next logged-in account, if any.
-        if (/exceed quota|1005/.test(msg)) {
-          if (rotateAccount('1005 on ' + (activeAccount().name))) {
-            // wait for the old child to exit (ready -> false) and the new one
-            // to finish syncing (ready -> true)
-            for (let i = 0; i < 20 && this.ready; i++) await sleep(500);
-            for (let i = 0; i < 60 && !this.ready; i++) await sleep(500);
-            if (this.ready) {
-              log('retrying request on rotated account');
-              r = await sendOnce();
-              if (!r.error) { /* fall through to result handling below */ }
-            }
-          }
-        }
-        if (r.error) {
-          const m2 = JSON.stringify(r.error);
-          if (/exceed quota|1005/.test(m2)) {
-            markQuotaDrained();
-            return { error: { message: 'All ZCode accounts exhausted or plan inactive (upstream code 1005) — run `zbridge` to check accounts/claims.' } };
-          }
-          return { error: r.error };
-        }
+        log('generateText error (req=' + requestedModel + ' eff=' + effectiveModel + ' acc=' + (this.account ? this.account.name : 'default') + '):', msg.slice(0, 3000));
+        const isQuota = /exceed quota|1005|balance.*empty|insufficient.*quota/i.test(msg);
+        return { error: r.error, isQuotaExhausted: isQuota };
       }
       let result = r.result;
       // Thinking can swallow a small output budget: retry once with a bigger cap.
@@ -815,6 +1104,7 @@ class ZcodeClient {
       if (empty && params.maxOutputTokens < 8192) {
         log('empty length-truncated response, retrying with maxOutputTokens=8192');
         params.maxOutputTokens = 8192;
+        params.operationId = 'op-' + crypto.randomUUID();
         const r2 = await this.send('workspace/generateText', params, 300_000);
         if (r2.result) result = r2.result;
         else if (r2.error) return { error: r2.error };
@@ -955,10 +1245,110 @@ function parseJsonSafe(s) {
 
 // ------------------------------------------------------------- HTTP layer ----
 // Lazy: control commands (status/stop/logs) must not boot the whole runtime.
-let client = null;
+const clientPool = new Map();
+function getClientForAccount(acc) {
+  if (!acc) acc = activeAccount();
+  let c = clientPool.get(acc.name);
+  if (!c || !c.child || c.child.exitCode !== null) {
+    c = new ZcodeClient(acc);
+    clientPool.set(acc.name, c);
+  }
+  return c;
+}
 function getClient() {
-  if (!client) client = new ZcodeClient();
-  return client;
+  return getClientForAccount(activeAccount());
+}
+
+let roundRobinIdx = 0;
+function getNextClient(excludeNames = new Set()) {
+  const routing = getRoutingMode();
+  const allUsable = getUsableAccounts();
+  const usable = allUsable.filter(a => !excludeNames.has(a.name));
+
+  if (!usable.length) {
+    // If all usable accounts are excluded or none usable, try any logged-in account not excluded
+    const all = loadAccounts().accounts.filter(a => fs.existsSync(accountCredFile(a)));
+    const remaining = all.filter(a => !excludeNames.has(a.name));
+    const fallback = remaining.length ? remaining[0] : (all[0] || activeAccount());
+    return getClientForAccount(fallback);
+  }
+
+  if (routing === 'fill-first') {
+    const active = activeAccount();
+    const actUsable = usable.find(x => x.name === active.name);
+    return getClientForAccount(actUsable || usable[0]);
+  }
+
+  // round-robin across usable accounts
+  const chosen = usable[roundRobinIdx % usable.length];
+  roundRobinIdx = (roundRobinIdx + 1) % usable.length;
+  return getClientForAccount(chosen);
+}
+
+function warmClientPool() {
+  const usable = getUsableAccounts();
+  for (const acc of usable) {
+    getClientForAccount(acc);
+  }
+}
+
+function shutdownClientPool() {
+  for (const [, c] of clientPool) {
+    try { if (c.child) c.child.kill('SIGTERM'); } catch {}
+  }
+}
+
+function respawnClientPool() {
+  for (const [, c] of clientPool) {
+    try { if (c.child) c.child.kill('SIGHUP'); } catch {}
+  }
+}
+
+async function generateWithFailover(options) {
+  const triedAccounts = new Set();
+  const allAccounts = loadAccounts().accounts.filter(a => fs.existsSync(accountCredFile(a)));
+  const maxAttempts = Math.max(1, allAccounts.length);
+  let lastOut = null;
+
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const c = getNextClient(triedAccounts);
+    const accName = (c && c.account) ? c.account.name : activeAccount().name;
+    triedAccounts.add(accName);
+    log(`dispatching request to account "${accName}" (mode: ${getRoutingMode()})`);
+
+    const out = await c.generate(options);
+    if (!out.error) {
+      clearAccountExhaustion(accName);
+      return out;
+    }
+
+    lastOut = out;
+    const isExhausted = out.isQuotaExhausted || /exceed quota|1005|balance.*empty|insufficient.*quota/i.test(JSON.stringify(out.error));
+
+    if (isExhausted) {
+      log(`account "${accName}" quota exhausted, marking paused`);
+      markAccountExhausted(accName, '1005 quota exhausted');
+
+      const remainingUsable = getUsableAccounts().filter(a => !triedAccounts.has(a.name));
+      if (remainingUsable.length > 0) {
+        log(`automatically failing over request to next account "${remainingUsable[0].name}"...`);
+        continue;
+      } else {
+        markQuotaDrained();
+        return {
+          error: {
+            message: 'All ZCode accounts exhausted (upstream code 1005). Wait for daily renewal (19:30) or add more accounts via `zbridge`.',
+            type: 'insufficient_quota',
+            code: 1005,
+          }
+        };
+      }
+    }
+
+    return out;
+  }
+
+  return lastOut || { error: { message: 'All accounts failed' } };
 }
 
 // Start plan (rev-30 builtin, CLI 3.14.4): GLM-5.3-Flash, GLM-5.2, GLM-5-Turbo.
@@ -1051,13 +1441,14 @@ async function handleChatCompletions(req, res, body) {
   const messages = openaiToZcode((body.messages || []).filter(m => m.role !== 'system'));
   if (!messages.length) return sendJson(res, 400, { error: { message: 'messages required', type: 'invalid_request_error' } });
 
-  const out = await getClient().generate({
+  const out = await generateWithFailover({
     systemBlocks,
     messages,
     tools: openaiToolDefs(body.tools),
     maxOutputTokens: clampMaxTokens(body.max_tokens ?? body.max_completion_tokens),
     reasoningLevel: reasoningFromRequest(body),
     modelId: model,
+    signal: req.signal,
   });
   if (out.error) {
     return sendJson(res, 502, { error: { message: `upstream: ${out.error.message || JSON.stringify(out.error)}`, type: 'upstream_error' } });
@@ -1113,7 +1504,7 @@ async function handleAnthropicMessages(req, res, body, stream) {
   const messages = anthropicToZcode(body);
   if (!messages.length) return sendJson(res, 400, { type: 'error', error: { type: 'invalid_request_error', message: 'messages required' } });
 
-  const out = await getClient().generate({
+  const out = await generateWithFailover({
     systemBlocks,
     messages,
     tools: openaiToolDefs((body.tools || []).map(t => ({
@@ -1123,6 +1514,7 @@ async function handleAnthropicMessages(req, res, body, stream) {
     maxOutputTokens: clampMaxTokens(body.max_tokens),
     reasoningLevel: reasoningFromRequest(body),
     modelId: resolveModel(requestedModel),
+    signal: req.signal,
   });
   if (out.error) {
     return sendJson(res, 502, { type: 'error', error: { type: 'api_error', message: `upstream: ${out.error.message || JSON.stringify(out.error)}` } });
@@ -1201,19 +1593,33 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://localhost');
   try {
     if (req.method === 'GET' && url.pathname === '/health') {
-      const jwtOk = (() => { try { loadJwt(); return true; } catch { return false; } })();
-      if (!client) {
-        return sendJson(res, 200, {
-          ok: true, ready: false, captchaPool: tokens.length, cliRunning: false,
-          detail: !jwtOk
-            ? 'no ZCode credentials (~/.zcode/v2/credentials.json missing or unreadable) — log in to the ZCode desktop app once on this machine'
-            : 'bootstrap pending (connectivity probe / CLI startup)',
-        });
-      }
-      const cliRunning = !!(client.child && client.child.exitCode === null);
-      // Quota awareness: when the bridge has 1005'd since its last success,
-      // say so loudly and tell the user the exact next step. Plan data is
-      // cached; a stale cache triggers a background refresh (never blocks).
+      const accountsData = loadAccounts();
+      const anyCreds = accountsData.accounts.some(a => fs.existsSync(accountCredFile(a)));
+      const clients = Array.from(clientPool.values());
+      const cliRunning = clients.some(c => c.child && c.child.exitCode === null);
+      const anyReady = clients.some(c => c.ready);
+      const activeC = getClientForAccount(activeAccount());
+
+      const accountsList = accountsData.accounts.map(a => {
+        const hasCreds = fs.existsSync(accountCredFile(a));
+        const p = accountPlans.get(a.name);
+        const c = clientPool.get(a.name);
+        const isExhausted = !!((a.exhaustedUntil && a.exhaustedUntil > Date.now()) ||
+                               (a.quotaEmptyUntil && a.quotaEmptyUntil > Date.now()));
+        return {
+          name: a.name,
+          active: a.name === accountsData.active,
+          hasCredentials: hasCreds,
+          ready: !!(c && c.ready),
+          exhausted: isExhausted,
+          exhaustedUntil: a.exhaustedUntil || null,
+          quotaEmptyUntil: a.quotaEmptyUntil || null,
+          quotaLeft: p ? p.quotaLeft : null,
+          remainingTokens: p ? p.remainingTokens : null,
+          totalTokens: p ? p.totalTokens : null,
+        };
+      });
+
       const drained = quotaState.lastQuotaAt > quotaState.lastOkAt;
       let action = null;
       if (drained) {
@@ -1228,22 +1634,30 @@ const server = http.createServer(async (req, res) => {
         } else {
           action = 'quota drained — checking plan state; if no plan shows in the ZCode GUI, claim the 100M card there';
         }
-        if (Date.now() - planCache.at > 60_000) refreshPlan().catch(() => {});
       }
+      if (Date.now() - planCache.at > 30_000) refreshPlan().catch(() => {});
       return sendJson(res, 200, {
         ok: true,
-        ready: !!client.ready,
+        ready: anyReady || !!(activeC && activeC.ready),
+        routing: getRoutingMode(),
+        account: activeAccount().name,
+        accounts: accountsData.accounts.length,
+        accountsList,
         captchaPool: tokens.length,
         cliRunning,
-        credentials: jwtOk,
-        account: activeAccount().name,
-        accounts: loadAccounts().accounts.length,
+        credentials: anyCreds,
         quota: drained ? 'drained' : 'ok',
+        quotaLeft: planCache.quotaLeft || null,
+        quotaSummary: planCache.quotaSummary || null,
+        quotaPercent: planCache.percent ?? null,
+        quotaTokens: planCache.remainingTokens ?? null,
+        quotaTotal: planCache.totalTokens ?? null,
+        quotaDetails: planCache.balances || [],
         plan: planCache.active === null ? 'unknown' : (planCache.active ? 'active' : 'missing'),
         action,
-        detail: !cliRunning ? (client.waitReason || 'CLI not running')
-          : !jwtOk ? 'CLI running but ZCode credentials missing'
-          : client.ready ? null : (client.waitReason || 'CLI up, syncing account config'),
+        detail: !cliRunning ? (activeC?.waitReason || 'CLI not running')
+          : !anyCreds ? 'CLI running but ZCode credentials missing'
+          : (anyReady || activeC?.ready) ? null : (activeC?.waitReason || 'CLI up, syncing account config'),
       });
     }
     if (!checkAuth(req)) return sendJson(res, 401, { error: { message: 'invalid api key', type: 'invalid_request_error' } });
@@ -1547,11 +1961,16 @@ function cliLogout(name) {
 }
 function listAccounts() {
   const a = loadAccounts();
+  const routing = getRoutingMode();
+  console.log(`Routing mode: ${routing}\n`);
   for (const x of a.accounts) {
     const loggedIn = fs.existsSync(accountCredFile(x));
-    const exhausted = x.exhaustedUntil && x.exhaustedUntil > Date.now();
+    const exhausted = (x.exhaustedUntil && x.exhaustedUntil > Date.now()) || (x.quotaEmptyUntil && x.quotaEmptyUntil > Date.now());
+    const reason = x.exhaustedUntil ? `exhausted-until ${new Date(x.exhaustedUntil).toLocaleTimeString()}` : (x.quotaEmptyUntil ? 'quota-empty' : '');
+    const p = accountPlans.get(x.name);
+    const qStr = p && p.quotaLeft ? `\t${p.quotaLeft}` : '';
     console.log(`${x.name === a.active ? '*' : ' '} ${x.name}\t${loggedIn ? 'logged-in' : 'no-credentials'}` +
-      `${exhausted ? '\texhausted-until ' + new Date(x.exhaustedUntil).toISOString() : ''}\t${x.dir}`);
+      `${exhausted ? '\t' + reason : '\tactive'}${qStr}\t${x.dir}`);
   }
 }
 function useAccount(name) {
@@ -1722,6 +2141,19 @@ async function ctl() {
     listAccounts();
   } else if (sub === 'use') {
     useAccount(argv[1]);
+  } else if (sub === 'routing') {
+    const mode = argv[1];
+    if (mode) {
+      try {
+        setRoutingMode(mode);
+        console.log(`routing mode set to: ${mode}`);
+      } catch (e) {
+        console.error(e.message);
+        process.exitCode = 1;
+      }
+    } else {
+      console.log(`current routing mode: ${getRoutingMode()}`);
+    }
   } else if (sub === 'logs') {
     const n = Number(argv[1] || 40);
     try {
@@ -1763,7 +2195,7 @@ async function main() {
     return;
   }
   if (['status','start','restart','stop','logs','claim','help','--help','-h',
-       'quit','tray','autostart','autostart-toggle','login','logout','accounts','use'].includes(sub)) {
+       'quit','tray','autostart','autostart-toggle','login','logout','accounts','use','routing'].includes(sub)) {
     await ctl();
     return;
   }
@@ -1791,7 +2223,7 @@ function boot() {
   // non-direct route, the periodic checker respawns the child (SIGHUP ->
   // exit handler) so it inherits the proxy env. This keeps /health truthful
   // within seconds on machines where every probe times out (VPN off etc.).
-  getClient();
+  warmClientPool();
   resolveProxy(true)
     .then(() => refreshPlan())          // warm plan cache for /health actions
     .then(() => captchaPolicyRequired())
@@ -1834,9 +2266,9 @@ function boot() {
   setInterval(async () => {
     const before = resolvedProxy;
     await resolveProxy(true);
-    if (resolvedProxy !== before && client) {
-      log(`connectivity changed (${before || 'direct'} -> ${resolvedProxy || 'direct'}), respawning CLI`);
-      try { client.child && client.child.kill('SIGHUP'); } catch { /* exit handler respawns */ }
+    if (resolvedProxy !== before) {
+      log(`connectivity changed (${before || 'direct'} -> ${resolvedProxy || 'direct'}), respawning client pool`);
+      respawnClientPool();
     }
     captchaPolicyRequired().then(req => { if (req && tokens.length < 8) ensureTokens(); }).catch(() => {});
   }, 5 * 60_000);
@@ -1847,7 +2279,7 @@ function boot() {
       // Kill the tray helper too: it lives in this cgroup, and systemd would
       // otherwise wait for it, time out and mark the unit failed on every stop.
       try { killTray(); } catch { /* ignore */ }
-      try { if (client) { getClient().child && client.child.kill('SIGTERM'); } } catch { /* ignore */ }
+      try { shutdownClientPool(); } catch { /* ignore */ }
       try { fs.rmSync(PID_PATH, { force: true }); } catch {}
       server.close(() => process.exit(0));
       setTimeout(() => process.exit(0), 2000);

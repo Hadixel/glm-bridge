@@ -20,7 +20,55 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
-const { execFile } = require('child_process');
+const { execFile, execFileSync } = require('child_process');
+
+function getSystemProxy() {
+  const envProxy = process.env.GLM_BRIDGE_PROXY
+    || process.env.HTTPS_PROXY || process.env.https_proxy
+    || process.env.ALL_PROXY || process.env.all_proxy
+    || process.env.HTTP_PROXY || process.env.http_proxy;
+  if (envProxy) return envProxy;
+  if (process.platform === 'linux') {
+    try {
+      const mode = execFileSync('gsettings', ['get', 'org.gnome.system.proxy', 'mode'],
+        { encoding: 'utf8', timeout: 800, stdio: ['ignore', 'pipe', 'ignore'] }).trim().replace(/'/g, '');
+      if (mode === 'manual') {
+        const host = execFileSync('gsettings', ['get', 'org.gnome.system.proxy.http', 'host'],
+          { encoding: 'utf8', timeout: 800, stdio: ['ignore', 'pipe', 'ignore'] }).trim().replace(/'/g, '');
+        const port = execFileSync('gsettings', ['get', 'org.gnome.system.proxy.http', 'port'],
+          { encoding: 'utf8', timeout: 800, stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+        if (host && port && port !== '0') return `http://${host}:${port}`;
+        const socksHost = execFileSync('gsettings', ['get', 'org.gnome.system.proxy.socks', 'host'],
+          { encoding: 'utf8', timeout: 800, stdio: ['ignore', 'pipe', 'ignore'] }).trim().replace(/'/g, '');
+        const socksPort = execFileSync('gsettings', ['get', 'org.gnome.system.proxy.socks', 'port'],
+          { encoding: 'utf8', timeout: 800, stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+        if (socksHost && socksPort && socksPort !== '0') return `socks5://${socksHost}:${socksPort}`;
+      }
+    } catch {}
+  } else if (process.platform === 'win32') {
+    try {
+      const out = execFileSync('reg', ['query', 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings', '/v', 'ProxyServer'],
+        { encoding: 'utf8', timeout: 1000, stdio: ['ignore', 'pipe', 'ignore'] });
+      const m = out.match(/ProxyServer\s+REG_SZ\s+(\S+)/);
+      if (m && m[1]) {
+        const server = m[1];
+        return server.includes('://') ? server : `http://${server}`;
+      }
+    } catch {}
+  } else if (process.platform === 'darwin') {
+    try {
+      const out = execFileSync('scutil', ['--proxy'],
+        { encoding: 'utf8', timeout: 1000, stdio: ['ignore', 'pipe', 'ignore'] });
+      const httpEnabled = /HTTPEnable\s*:\s*1/.test(out);
+      const hostMatch = out.match(/HTTPProxy\s*:\s*(\S+)/);
+      const portMatch = out.match(/HTTPPort\s*:\s*(\d+)/);
+      if (httpEnabled && hostMatch && portMatch) {
+        return `http://${hostMatch[1]}:${portMatch[1]}`;
+      }
+    } catch {}
+  }
+  return null;
+}
 
 const args = process.argv.slice(2);
 const argOf = (name, dflt) => {
@@ -32,11 +80,15 @@ const JSON_OUT = args.includes('--json');
 const DRY = args.includes('--dry-run');
 const FORCE = args.includes('--force');   // claim even if a plan already looks active
 const PREVIEW_ONLY = args.includes('--preview');  // list claimable offers, no claim
-const PROXY = process.env.GLM_BRIDGE_PROXY || 'http://127.0.0.1:10809';
+const PROXY = process.env.GLM_BRIDGE_PROXY
+  || process.env.HTTPS_PROXY || process.env.https_proxy
+  || process.env.ALL_PROXY || process.env.all_proxy
+  || getSystemProxy() || 'http://127.0.0.1:10809';
 // The captcha browser must use the SAME route as the claim request or the
 // verify param is rejected. Direct works whenever egress is up; the proxy is
 // only needed when direct is blocked, and then for both.
-const MINT_PROXY = process.env.MINT_PROXY || process.env.GLM_BRIDGE_MINT_PROXY || '';
+const MINT_PROXY = process.env.MINT_PROXY || process.env.GLM_BRIDGE_MINT_PROXY
+  || PROXY || '';
 
 const HOME = os.homedir();
 const say = m => { if (!JSON_OUT) process.stderr.write('[claim] ' + m + '\n'); };
@@ -332,9 +384,15 @@ async function previewPlans() {
     '-H', 'Authorization: Bearer ' + jwt,
     ...SOURCE_HEADERS(),
     '-H', 'User-Agent: ZCode/3.14.4', url];
-  const out = await new Promise(res => execFile('curl', args,
+  let out = await new Promise(res => execFile('curl', args,
     { timeout: 40000 }, (e, so) => res(String(so || ''))));
-  const i = out.lastIndexOf('\n__CODE__');
+  let i = out.lastIndexOf('\n__CODE__');
+  let code = i >= 0 ? Number(out.slice(i + 9)) || 0 : 0;
+  if (code === 0 && PROXY) {
+    out = await new Promise(res => execFile('curl', [...args.slice(0, -1), '-x', PROXY, url],
+      { timeout: 40000 }, (e, so) => res(String(so || ''))));
+    i = out.lastIndexOf('\n__CODE__');
+  }
   if (i < 0) return null;
   const body = out.slice(0, i);
   try {

@@ -53,9 +53,14 @@ $script:ni.Visible = $true
 $menu = New-Object System.Windows.Forms.ContextMenuStrip
 
 # 1. Header / Status
-$statusItem = New-Object System.Windows.Forms.ToolStripMenuItem('GLM Bridge')
-$statusItem.Enabled = $false
-$menu.Items.Add($statusItem) | Out-Null
+$script:statusItem = New-Object System.Windows.Forms.ToolStripMenuItem('GLM Bridge')
+$script:statusItem.Enabled = $false
+$menu.Items.Add($script:statusItem) | Out-Null
+
+$script:quotaItem = New-Object System.Windows.Forms.ToolStripMenuItem('')
+$script:quotaItem.Enabled = $false
+$script:quotaItem.Visible = $false
+$menu.Items.Add($script:quotaItem) | Out-Null
 $menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null
 
 # 2. Auto-start toggle
@@ -88,14 +93,42 @@ $menu.Items.Add($quitItem) | Out-Null
 
 $script:ni.ContextMenuStrip = $menu
 
+# Periodic health & status updater (every 5 seconds)
+$script:timer = New-Object System.Windows.Forms.Timer
+$script:timer.Interval = 5000
+$script:timer.Add_Tick({
+    try {
+        $resp = Invoke-RestMethod -Uri "http://127.0.0.1:3010/health" -TimeoutSec 2 -ErrorAction SilentlyContinue
+        if ($resp -and $resp.ready) {
+            $script:statusItem.Text = '● GLM Bridge (Active)'
+            $ql = $resp.quotaLeft
+            if ($ql) {
+                $script:quotaItem.Text = "  Quota Left: $ql"
+                $script:quotaItem.Visible = $true
+                $tip = "GLM Bridge ($ql)"
+                if ($tip.Length -gt 63) { $tip = $tip.Substring(0, 63) }
+                $script:ni.Text = $tip
+            } else {
+                $script:quotaItem.Visible = $false
+                $script:ni.Text = 'GLM Bridge'
+            }
+        } else {
+            $script:statusItem.Text = '○ GLM Bridge (Stopped)'
+            $script:quotaItem.Visible = $false
+            $script:ni.Text = 'GLM Bridge'
+        }
+    } catch {}
+})
+$script:timer.Start()
+
 $script:ni.Add_DoubleClick({
     $st = Invoke-Glm 'status'
     if ($st) { $script:ni.ShowBalloonTip(4000, 'GLM Bridge Status', $st, [System.Windows.Forms.ToolTipIcon]::Info) }
 }) | Out-Null
-
 try {
     [System.Windows.Forms.Application]::Run()
 } finally {
+    if ($script:timer) { $script:timer.Stop(); $script:timer.Dispose() }
     $script:ni.Visible = $false
     $script:ni.Dispose()
     Remove-Item $PidFile -Force -ErrorAction SilentlyContinue

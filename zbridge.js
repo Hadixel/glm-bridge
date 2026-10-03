@@ -175,7 +175,18 @@ async function tui() {
         : `${c.red}missing credentials${c.reset}`;
 
       console.log(`  ${c.bold}Service:${c.reset}  ${statusBadge}        ${c.bold}Engine:${c.reset} ${cliBadge}    ${c.bold}Auth:${c.reset} ${credBadge}`);
+      const quotaBadge = health.quotaLeft
+        ? `${c.green}${c.bold}${health.quotaLeft}${c.reset}`
+        : (health.quota === 'drained' ? `${c.red}${c.bold}drained${c.reset}` : `${c.green}ok${c.reset}`);
+      const routingMode = (health.routing || 'round-robin');
+      const routingBadge = routingMode === 'round-robin'
+        ? `${c.cyan}${c.bold}Round-Robin (Auto-balanced)${c.reset}`
+        : `${c.yellow}${c.bold}Fill-First (Auto-failover)${c.reset}`;
+      console.log(`  ${c.bold}Routing:${c.reset}  ${routingBadge}        ${c.bold}Quota Left:${c.reset} ${quotaBadge}`);
       console.log(`  ${c.bold}Account:${c.reset}  ${c.cyan}${c.bold}★ ${health.account || activeAcc.name}${c.reset} ${c.dim}(${health.accounts || accountsData.accounts.length} registered)${c.reset}`);
+      if (health.quotaSummary) {
+        console.log(`  ${c.bold}Pool:${c.reset}     ${c.dim}${health.quotaSummary}${c.reset}`);
+      }
 
       if (health.detail) {
         console.log(`  ${c.yellow}${c.dim}Note:     ${health.detail}${c.reset}`);
@@ -199,9 +210,9 @@ async function tui() {
     console.log(`  ${c.bold}${c.blue}Service Controls${c.reset}`);
     console.log(`   ${c.cyan}[1]${c.reset} Status       ${c.cyan}[2]${c.reset} Start        ${c.cyan}[3]${c.reset} Stop         ${c.cyan}[4]${c.reset} Restart`);
     console.log('');
-    console.log(`  ${c.bold}${c.magenta}Accounts & Authentication${c.reset} ${c.dim}(current: ${activeAcc.name})${c.reset}`);
-    console.log(`   ${c.cyan}[5]${c.reset} Switch account       ${c.cyan}[6]${c.reset} Log in new account ${c.dim}(terminal OAuth)${c.reset}`);
-    console.log(`   ${c.cyan}[7]${c.reset} Log out / remove account`);
+    console.log(`  ${c.bold}${c.magenta}Accounts & Load Balancing${c.reset} ${c.dim}(mode: ${health?.routing || 'round-robin'}, active: ${activeAcc.name})${c.reset}`);
+    console.log(`   ${c.cyan}[5]${c.reset} Accounts & status    ${c.cyan}[r]${c.reset} Toggle routing ${health?.routing === 'fill-first' ? `${c.yellow}(Fill-First)${c.reset}` : `${c.cyan}(Round-Robin)${c.reset}`}`);
+    console.log(`   ${c.cyan}[6]${c.reset} Log in new account ${c.dim}(terminal OAuth)${c.reset}   ${c.cyan}[7]${c.reset} Log out account`);
     console.log('');
     console.log(`  ${c.bold}${c.green}Models & Plan Claims${c.reset}`);
     console.log(`   ${c.cyan}[8]${c.reset} Claim daily plan ${c.dim}(100M/account)${c.reset}     ${c.cyan}[9]${c.reset} View models & 9router info`);
@@ -252,12 +263,16 @@ async function tui() {
         return { ...acc, hasCreds, isActive };
       });
 
-      console.log(`   ${c.dim}Name            Status          Directory${c.reset}`);
+      console.log(`   ${c.dim}Name            Status          Quota           Directory${c.reset}`);
       console.log(`   ${c.gray}${'─'.repeat(width - 6)}${c.reset}`);
       for (const a of parsed) {
         const mark = a.isActive ? `${c.green}${c.bold}★ ${a.name.padEnd(12)}${c.reset}` : `  ${a.name.padEnd(12)}`;
-        const status = a.hasCreds ? `${c.green}● Logged in    ${c.reset}` : `${c.yellow}○ No credentials${c.reset}`;
-        console.log(`  ${mark}  ${status}  ${c.dim}${a.dir}${c.reset}`);
+        const itemInfo = (health?.accountsList || []).find(x => x.name === a.name);
+        const status = !a.hasCreds ? `${c.yellow}○ No creds     ${c.reset}`
+          : itemInfo?.exhausted ? `${c.red}● Exhausted    ${c.reset}`
+          : `${c.green}● Active       ${c.reset}`;
+        const qStr = (itemInfo?.quotaLeft || '–').padEnd(14);
+        console.log(`  ${mark}  ${status}  ${c.cyan}${qStr}${c.reset}  ${c.dim}${a.dir}${c.reset}`);
       }
       console.log('');
 
@@ -267,6 +282,13 @@ async function tui() {
         const res = await sh(['use', target]);
         console.log(`${c.green}${res}${c.reset}`);
       }
+      await pause();
+    } else if (choice === 'r') {
+      const cur = health?.routing || 'round-robin';
+      const target = cur === 'round-robin' ? 'fill-first' : 'round-robin';
+      console.log(`${c.dim}Switching routing mode from ${cur} to ${target}...${c.reset}`);
+      const res = await sh(['routing', target]);
+      console.log(`\n${c.green}${res}${c.reset}`);
       await pause();
     } else if (choice === '6') {
       // New account login

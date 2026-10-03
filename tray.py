@@ -145,6 +145,9 @@ class GLMTray:
         self.account_item.set_sensitive(False)
         self.menu.append(self.account_item)
 
+        self.quota_item = Gtk.MenuItem(label="")
+        self.quota_item.set_sensitive(False)
+        self.menu.append(self.quota_item)
         self.menu.append(Gtk.SeparatorMenuItem())
 
         # Auto-start toggle item
@@ -179,17 +182,52 @@ class GLMTray:
                     self.title_item.set_label("● GLM Bridge (Active)")
                     acc = data.get('account', 'default')
                     total = data.get('accounts', 1)
-                    plan = data.get('plan', 'active')
-                    quota = data.get('quota', 'ok')
-                    self.account_item.set_label(f"  Account: {acc} ({total} active) · Quota: {quota}")
+                    routing = data.get('routing', 'round-robin')
+                    quota_left = data.get('quotaLeft')
+                    quota_summary = data.get('quotaSummary')
+                    acc_list = data.get('accountsList') or []
+
+                    if quota_left:
+                        try:
+                            self.indicator.set_label(f" {quota_left}", "GLM Bridge Quota")
+                        except Exception:
+                            pass
+                        mode_str = "Round-Robin" if routing == 'round-robin' else "Fill-First"
+                        self.account_item.set_label(f"  {mode_str} ({total} accounts) · Quota: {quota_left}")
+                    else:
+                        quota = data.get('quota', 'ok')
+                        self.account_item.set_label(f"  Account: {acc} ({total} active) · Quota: {quota}")
                     self.account_item.show()
+
+                    if len(acc_list) > 1:
+                        detail_parts = []
+                        for a in acc_list:
+                            aname = a.get('name')
+                            aql = a.get('quotaLeft') or ('exhausted' if a.get('exhausted') else ('active' if a.get('hasCredentials') else 'no creds'))
+                            detail_parts.append(f"{aname}: {aql}")
+                        self.quota_item.set_label(f"  Pool: {' · '.join(detail_parts)}")
+                        self.quota_item.show()
+                    elif quota_summary:
+                        self.quota_item.set_label(f"  Remaining: {quota_summary}")
+                        self.quota_item.show()
+                    else:
+                        self.quota_item.hide()
                 else:
                     self.title_item.set_label("▲ GLM Bridge (Starting...)")
+                    try:
+                        self.indicator.set_label("", "")
+                    except Exception:
+                        pass
                     self.account_item.hide()
+                    self.quota_item.hide()
         except Exception:
             self.title_item.set_label("○ GLM Bridge (Stopped)")
+            try:
+                self.indicator.set_label("", "")
+            except Exception:
+                pass
             self.account_item.hide()
-
+            self.quota_item.hide()
         return True  # Keep timer running
 
     def on_autostart_toggled(self, widget):
