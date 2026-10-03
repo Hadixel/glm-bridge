@@ -13,8 +13,13 @@ function Run-Capture([scriptblock]$sb) {
   # Run a native command, merging stderr into stdout, and do NOT let stderr
   # text (like Node's DEP0169 warning) trip $ErrorActionPreference='Stop'
   # (PowerShell 5.1 turns stderr lines into ErrorRecords that abort the run).
-  $out = & $sb 2>&1
-  return ($out | ForEach-Object { "$_" }) -join "`n"
+  $prevEap = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try {
+    $out = & $sb 2>&1
+    return (($out | ForEach-Object { "$_" }) -join "`n")
+  } catch { return '' }   # a failed `stop` is fine — nothing may be running
+  finally { $ErrorActionPreference = $prevEap }
 }
 
 $RepoUrl    = 'https://github.com/Hadixel/glm-bridge.git'
