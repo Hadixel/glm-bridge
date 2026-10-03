@@ -443,16 +443,18 @@ async function planActive() {
       : { ok: true, plans: prev });
     return;
   }
-  if (!FORCE && await planActive().catch(() => false)) {
-    emit({ ok: true, claimed: false, reason: 'already-active', planId: PLAN_ID });
-    return;
-  }
-  // Discover the real offer ids from preview (desktop behaviour). An EMPTY
-  // preview that ANSWERED means there is nothing to claim right now — POSTing
-  // a stale hardcoded plan id just burns a fresh captcha token (1001).
+  // Preview FIRST. The baseline daily plan (zcode-v3-start-plan-0817, 3M+5M)
+  // is auto-granted to every new account and is always "active", so checking
+  // planActive() first would suppress claiming the 100M trust offer forever —
+  // the "new account only gets 3M" bug. Only skip when preview ANSWERS empty.
   const prev = await previewPlans().catch(() => null);
   let targets;
   if (prev === null) {
+    // Preview unreachable: fall back to planActive() heuristic.
+    if (!FORCE && await planActive().catch(() => false)) {
+      emit({ ok: true, claimed: false, reason: 'already-active', planId: PLAN_ID });
+      return;
+    }
     say('preview unreachable, falling back to plan id ' + PLAN_ID);
     targets = [{ planId: PLAN_ID, name: 'configured' }];
   } else if (!prev.length) {

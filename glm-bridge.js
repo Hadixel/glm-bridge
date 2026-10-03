@@ -125,6 +125,25 @@ function clearAccountExhaustion(name) {
   } catch {}
 }
 
+// Per-model capacity check for smart routing: an account is usable for a
+// given model if ANY bucket covering that model still has tokens left
+// (e.g. hadij: drained 100M Flash pool but leftover GLM-5.3 daily tokens).
+function accountHasModelTokens(accName, requestedModel) {
+  const plan = accountPlans.get(accName);
+  if (!plan || plan.err) return true;  // unknown -> let it try
+  const mq = plan.modelQuotas || {};
+  const norm = s => String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  const want = norm(requestedModel);
+  for (const [m, v] of Object.entries(mq)) {
+    const mv = norm(m);
+    if (mv === want || mv.startsWith(want) || want.startsWith(mv)) {
+      return (v.remaining || 0) > 0;
+    }
+  }
+  return Object.values(mq).some(v => (v.remaining || 0) > 0);
+}
+
+
 function nextRenewalMs() {
   const parts = String(process.env.GLM_BRIDGE_CLAIM_AT || '19:30').split(':');
   const hh = Number.isFinite(Number(parts[0])) ? Number(parts[0]) : 19;
@@ -423,26 +442,30 @@ async function refreshAccountPlan(acc) {
     }
     res.modelQuotas = modelQuotas;
 
-    const mainPool = activeBalances.find(b => Number(b.total_units) >= 50_000_000)
-      || activeBalances[0];
+    // An account is only "empty" when EVERY bucket is drained. hadij-style
+    // accounts often have a drained 100M Flash pool but leftover GLM-5.3
+    // tokens — parking the whole account there wasted the remainder.
+    const totalRem = activeBalances.reduce((s, b) => s + (Number(b.remaining_units) || 0), 0);
+    const totalCap = activeBalances.reduce((s, b) => s + (Number(b.total_units) || 0), 0);
+    const bestBucket = [...activeBalances].sort((a, b) =>
+      (Number(b.remaining_units) || 0) - (Number(a.remaining_units) || 0))[0];
+    const showBucket = bestBucket || activeBalances[0];
 
-    if (mainPool) {
-      const rem = Number(mainPool.remaining_units) || 0;
-      const tot = Number(mainPool.total_units) || 0;
-      const pct = tot > 0 ? Math.round((rem / tot) * 100) : 0;
-      res.remainingTokens = rem;
-      res.totalTokens = tot;
+    if (showBucket) {
+      const rem = Number(showBucket.remaining_units) || 0;
+      const pct = totalCap > 0 ? Math.round((totalRem / totalCap) * 100) : 0;
+      res.remainingTokens = totalRem;
+      res.totalTokens = totalCap;
       res.percent = pct;
-      res.quotaLeft = `${formatTokens(rem)} (${pct}%)`;
+      res.quotaLeft = `${formatTokens(totalRem)} (${pct}%)`;
 
-      const modelParts = Object.values(modelQuotas).map(m =>
-        `${m.model.replace(/^GLM-/, '')}: ${m.remainingFormatted}/${m.totalFormatted}`
-      );
-      res.quotaSummary = modelParts.length ? modelParts.join(' · ') : `${formatTokens(rem)} left`;
+      const modelParts = Object.values(modelQuotas)
+        .filter(m => m.remaining > 0)
+        .map(m => `${m.model.replace(/^GLM-/, '')}: ${m.remainingFormatted}/${m.totalFormatted}`);
+      res.quotaSummary = modelParts.length ? modelParts.join(' · ') : `${formatTokens(totalRem)} left`;
 
-      // Proactive empty detection: if remaining is 0, park until renewal
-      if (rem <= 0) {
-        markAccountEmpty(acc.name, 'balance 0 remaining');
+      if (totalRem <= 0) {
+        markAccountEmpty(acc.name, 'all balances drained');
       } else {
         clearAccountExhaustion(acc.name);
       }
@@ -1325,10 +1348,14 @@ function getClient() {
 }
 
 let roundRobinIdx = 0;
-function getNextClient(excludeNames = new Set()) {
+function getNextClient(excludeNames = new Set(), requestedModel = null) {
   const routing = getRoutingMode();
   const allUsable = getUsableAccounts();
-  const usable = allUsable.filter(a => !excludeNames.has(a.name));
+  const usable = allUsable.filter(a => {
+    if (excludeNames.has(a.name)) return false;
+    if (requestedModel && !accountHasModelTokens(a.name, requestedModel)) return false;
+    return true;
+  });
 
   if (!usable.length) {
     // If all usable accounts are excluded or none usable, try any logged-in account not excluded
@@ -1370,18 +1397,34 @@ function respawnClientPool() {
 }
 
 async function generateWithFailover(options) {
+  const requestedModel = options.modelId || 'GLM-5.3-Flash';
   const triedAccounts = new Set();
   const allAccounts = loadAccounts().accounts.filter(a => fs.existsSync(accountCredFile(a)));
   const maxAttempts = Math.max(1, allAccounts.length);
   let lastOut = null;
 
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    const c = getNextClient(triedAccounts);
+    const c = getNextClient(triedAccounts, requestedModel);
+    if (!c) break;
     const accName = (c && c.account) ? c.account.name : activeAccount().name;
     triedAccounts.add(accName);
     log(`dispatching request to account "${accName}" (mode: ${getRoutingMode()})`);
 
-    const out = await c.generate(options);
+    let out = await c.generate(options);
+
+    // Per-model empty: if this account drained the bucket covering the
+    // requested model but OTHER accounts still have tokens for it, retry
+    // there instead of failing over the whole request.
+    if (out.error && !out.isQuotaExhausted) {
+      const errText = JSON.stringify(out.error);
+      const isModelQuota = /exceed quota|1005|insufficient.*quota|balance.*empty/i.test(errText);
+      const modelInFlight = options.modelId || requestedModel;
+      if (isModelQuota && !accountHasModelTokens(accName, modelInFlight)) {
+        log(`account "${accName}" has no ${modelInFlight} tokens left, trying another account`);
+        continue;
+      }
+    }
+
     if (!out.error) {
       clearAccountExhaustion(accName);
       return out;
@@ -1394,7 +1437,8 @@ async function generateWithFailover(options) {
       log(`account "${accName}" quota exhausted, marking paused`);
       markAccountExhausted(accName, '1005 quota exhausted');
 
-      const remainingUsable = getUsableAccounts().filter(a => !triedAccounts.has(a.name));
+      const remainingUsable = getUsableAccounts().filter(a =>
+        !triedAccounts.has(a.name) && accountHasModelTokens(a.name, requestedModel));
       if (remainingUsable.length > 0) {
         log(`automatically failing over request to next account "${remainingUsable[0].name}"...`);
         continue;
@@ -1410,6 +1454,7 @@ async function generateWithFailover(options) {
       }
     }
 
+    // Non-quota error: return immediately (failover only covers 1005).
     return out;
   }
 
