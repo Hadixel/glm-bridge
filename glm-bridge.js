@@ -954,8 +954,8 @@ class ZcodeClient {
     this.child = null;
     this.ready = false;
     this.id = 0;
+    this.activeRequests = 0;
     this.pending = new Map();
-    this.queue = Promise.resolve();
     this.restartDelay = 1000;
     this.start();
   }
@@ -1130,13 +1130,15 @@ class ZcodeClient {
 
   // Serialize upstream calls: Aliyun captcha can reject duplicate concurrent submits.
   generate({ systemBlocks, messages, tools, maxOutputTokens, reasoningLevel, modelId, signal }) {
+    this.activeRequests = (this.activeRequests || 0) + 1;
     const run = async () => {
-      if (!this.ready) {
-        // one nudge in case sync is lagging
-        await this.syncAccountConfig();
-        if (!this.ready) return { error: { message: 'bridge warming up, retry shortly' } };
-      }
-      if (signal && signal.aborted) return { error: { message: 'request aborted by client' } };
+      try {
+        if (!this.ready) {
+          // one nudge in case sync is lagging
+          await this.syncAccountConfig();
+          if (!this.ready) return { error: { message: 'bridge warming up, retry shortly' } };
+        }
+        if (signal && signal.aborted) return { error: { message: 'request aborted by client' } };
       // Known-rejected models (registry lacks them) go straight to Flash —
       // otherwise every glm-5.3 request paid a ~10s upstream rejection first.
       const requestedModel = modelId || 'GLM-5.3-Flash';
@@ -1250,11 +1252,12 @@ class ZcodeClient {
         const cur = a.accounts.find(x => x.name === a.active);
         if (cur && cur.exhaustedUntil) { delete cur.exhaustedUntil; saveAccounts(a); }
       } catch { /* non-fatal */ }
-      return { result };
+        return { result };
+      } finally {
+        this.activeRequests = Math.max(0, (this.activeRequests || 1) - 1);
+      }
     };
-    const p = this.queue.then(run, run);
-    this.queue = p.then(() => {}, () => {});
-    return p;
+    return run();
   }
 }
 
@@ -1416,10 +1419,26 @@ function getNextClient(excludeNames = new Set(), requestedModel = null) {
     return getClientForAccount(actUsable || usable[0]);
   }
 
-  // round-robin across usable accounts
-  const chosen = usable[roundRobinIdx % usable.length];
-  roundRobinIdx = (roundRobinIdx + 1) % usable.length;
-  return getClientForAccount(chosen);
+  // Least-busy load balancing across usable accounts:
+  // Routes traffic away from accounts currently processing heavy multi-turn prompts
+  // (e.g. Claude Code 150k contexts) to completely idle accounts.
+  let best = usable[0];
+  let minActive = Infinity;
+  for (let i = 0; i < usable.length; i++) {
+    const idx = (roundRobinIdx + i) % usable.length;
+    const acc = usable[idx];
+    const c = clientPool.get(acc.name);
+    const active = c ? (c.activeRequests || 0) : 0;
+    if (active < minActive) {
+      minActive = active;
+      best = acc;
+      if (active === 0) {
+        roundRobinIdx = (idx + 1) % usable.length;
+        break; // Found an idle account, dispatch immediately!
+      }
+    }
+  }
+  return getClientForAccount(best);
 }
 
 function warmClientPool() {
