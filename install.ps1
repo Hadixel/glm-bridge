@@ -7,6 +7,15 @@
 # registers the bridge as an OpenAI-compatible node in a local 9router.
 
 $ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'   # Invoke-WebRequest speed + no progress noise
+
+function Run-Capture([scriptblock]$sb) {
+  # Run a native command, merging stderr into stdout, and do NOT let stderr
+  # text (like Node's DEP0169 warning) trip $ErrorActionPreference='Stop'
+  # (PowerShell 5.1 turns stderr lines into ErrorRecords that abort the run).
+  $out = & $sb 2>&1
+  return ($out | ForEach-Object { "$_" }) -join "`n"
+}
 
 $RepoUrl    = 'https://github.com/Hadixel/glm-bridge.git'
 $InstallDir = if ($env:GLM_BRIDGE_DIR) { $env:GLM_BRIDGE_DIR } else { Join-Path $HOME '.glm-bridge' }
@@ -123,9 +132,8 @@ if (-not (Test-Path (Join-Path $HOME '.zcode\v2\credentials.json'))) {
   }
 }
 
-# ------------------------------------------------------ scheduled task ------
 Say "stopping any running instance"
-& (Join-Path $InstallDir 'glm-bridge.js') stop 2>$null | Out-Null
+Run-Capture { & $node.Source (Join-Path $InstallDir 'glm-bridge.js') stop } | Out-Null
 
 $action = New-ScheduledTaskAction -Execute $node.Source -Argument "`"$InstallDir\glm-bridge.js`" run" -WorkingDirectory $InstallDir
 $trigger = New-ScheduledTaskTrigger -AtLogOn
