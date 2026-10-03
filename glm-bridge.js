@@ -751,7 +751,7 @@ async function waitForToken(ms) {
 
 async function captchaHeader() {
   if (!(await captchaPolicyRequired())) return {};   // upstream does not want one
-  const tok = await waitForToken(20_000);
+  const tok = await waitForToken(90_000);   // mint takes ~60s when pool is cold
   if (!tok) return null;                             // required but we have none
   const param = Buffer.from(JSON.stringify({
     captchaId: CAPTCHA.captchaId,
@@ -1051,14 +1051,26 @@ class ZcodeClient {
       if (m.method === 'session/requestRuntimePreferences') {
         result = { nativeSearchEnhancementsEnabled: false };
       } else if (m.method === 'interaction/requestProviderRuntimeHeaders') {
-        const hdrs = await captchaHeader();
+        const reason = (m.params || {}).reason || 'model-request';
+        // GLM-5.3 (premium) REQUIRES the captcha header: without it the server
+        // silently serves GLM-5.3-Flash and bills the Flash bucket (bucket
+        // deltas prove it). ignore the global skip policy whenever the
+        // in-flight model is GLM-5.3.
+        const needsCaptcha = (this.inFlightModel === 'GLM-5.3') || reason === 'captcha-retry';
+        let hdrs;
+        if (needsCaptcha) {
+          if (!captchaPolicyRequired()) forceCaptchaRequired('GLM-5.3 needs captcha');
+          hdrs = await captchaHeader();
+        } else {
+          hdrs = await captchaHeader();
+        }
         if (hdrs === null) {
           result = { headersApplied: false, errorMessage: 'captcha token pool exhausted' };
           log('captcha required but pool empty; refusing header request');
         } else {
           const jwt = loadJwt(this.account);
           result = { headersApplied: true, requestAuth: { apiKey: jwt, headers: hdrs } };
-          log(`runtime headers applied (acc=${this.account ? this.account.name : 'default'}, reason=${(m.params || {}).reason}, captcha=${Object.keys(hdrs).length ? 'token' : 'none'}, pool=${tokens.length})`);
+          log(`runtime headers applied (acc=${this.account ? this.account.name : 'default'}, reason=${reason}, model=${this.inFlightModel || '?'}, captcha=${Object.keys(hdrs).length ? 'token' : 'none'}, pool=${tokens.length})`);
         }
       } else {
         log('unhandled server request', m.method, JSON.stringify(m.params || {}).slice(0, 200));
@@ -1132,6 +1144,10 @@ class ZcodeClient {
       const requestedModel = modelId || 'GLM-5.3-Flash';
       const effectiveModel = (rejectedModels.has(requestedModel))
         ? 'GLM-5.3-Flash' : requestedModel;
+      // Premium model billing: the upstream silently downgrades captcha-less
+      // GLM-5.3 requests to GLM-5.3-Flash (verified by bucket deltas). Flag
+      // the client so its runtime-headers responder attaches a token.
+      this.inFlightModel = effectiveModel;
       const opId = 'op-' + crypto.randomUUID();
       const params = {
         operationId: opId,
@@ -1172,12 +1188,30 @@ class ZcodeClient {
       // GLM-5.3 joined the plan after the desktop last wrote its log). If the
       // upstream rejects the model as unknown/unentitled, retry once on the
       // plan's baseline Flash and remember what worked.
-      if (r.error && params.selection.modelId === 'GLM-5.3'
-          && /model|entitle|not\s*(?:found|supported|available)|not_entitled|invalid|1005|exceed quota/i.test(JSON.stringify(r.error))) {
-        log(`model ${params.selection.modelId} rejected or quota exhausted (${JSON.stringify(r.error).slice(0, 200)}), falling back to GLM-5.3-Flash`);
-        rejectedModels.add('GLM-5.3');
-        params.selection.modelId = 'GLM-5.3-Flash';
-        r = await sendOnce();
+      //
+      // IMPORTANT: quota exhaustion ("exceed quota limit") is PER-ACCOUNT —
+      // it must NOT blacklist GLM-5.3 globally, or one drained 3M bucket
+      // silently switches every other account (with full 3M buckets) to
+      // Flash too. Only a genuine registry/entitlement error marks the model
+      // rejected; quota errors fall back for THIS request only.
+      const accName = this.account ? this.account.name : 'default';
+      if (r.error && params.selection.modelId !== 'GLM-5.3-Flash') {
+        const errText = JSON.stringify(r.error);
+        const isQuotaErr = /exceed quota|1005|balance.*empty|insufficient.*quota/i.test(errText);
+        const isRegistryErr = !isQuotaErr
+          && /model|entitle|not\s*(?:found|supported|available)|not_entitled|invalid/i.test(errText);
+        if (params.selection.modelId === 'GLM-5.3' && (isQuotaErr || isRegistryErr)) {
+          if (isRegistryErr && !rejectedModels.has('GLM-5.3')) {
+            log(`model GLM-5.3 registry-rejected (${errText.slice(0, 160)}), blacklisting globally`);
+            rejectedModels.add('GLM-5.3');
+          } else if (isQuotaErr) {
+            log(`account "${accName}" GLM-5.3 quota exhausted, using Flash for this request`);
+          } else {
+            log(`model ${params.selection.modelId} rejected (${errText.slice(0, 160)}), falling back to GLM-5.3-Flash`);
+          }
+          params.selection.modelId = 'GLM-5.3-Flash';
+          r = await sendOnce();
+        }
       }
       if (r.error) {
         const msg = JSON.stringify(r.error);
@@ -2466,7 +2500,7 @@ function boot() {
   resolveProxy(true)
     .then(() => refreshPlan())          // warm plan cache for /health actions
     .then(() => captchaPolicyRequired())
-    .then(req => { if (req) ensureTokens(); })
+    .then(() => { if (tokens.length < 4) ensureTokens(); })   // pre-warm for GLM-5.3
     .catch(e => log('bootstrap error:', e.message));
 
   scheduleClaims();
@@ -2509,7 +2543,11 @@ function boot() {
       log(`connectivity changed (${before || 'direct'} -> ${resolvedProxy || 'direct'}), respawning client pool`);
       respawnClientPool();
     }
-    captchaPolicyRequired().then(req => { if (req && tokens.length < 8) ensureTokens(); }).catch(() => {});
+    // Always keep a small captcha pool: GLM-5.3 (premium) requests MUST carry
+    // a token or the upstream silently downgrades them to Flash (billing the
+    // Flash bucket). Minting ~60s/token means the pool must be pre-warmed,
+    // not built on demand.
+    captchaPolicyRequired().then(() => { if (tokens.length < 4) ensureTokens(); }).catch(() => {});
   }, 5 * 60_000);
 
   for (const sig of ['SIGINT', 'SIGTERM']) {

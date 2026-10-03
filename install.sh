@@ -40,7 +40,8 @@ say "using node: $NODE_BIN ($("$NODE_BIN" -v))"
 # ---------------------------------------------------------------- install ----
 if [ -d "$INSTALL_DIR/.git" ]; then
   say "updating existing checkout in $INSTALL_DIR"
-  git -C "$INSTALL_DIR" pull --ff-only
+  git -C "$INSTALL_DIR" checkout -- . >/dev/null 2>&1 || true
+  git -C "$INSTALL_DIR" pull --ff-only || say "warn: git pull failed (offline?)"
 else
   say "cloning into $INSTALL_DIR"
   git clone --depth 1 "$REPO_URL" "$INSTALL_DIR"

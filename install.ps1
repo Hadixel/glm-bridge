@@ -46,7 +46,10 @@ if (-not (Get-Command git -ErrorAction SilentlyContinue)) { Die 'git is required
 # ------------------------------------------------------------- install ------
 if (Test-Path (Join-Path $InstallDir '.git')) {
   Say "updating existing checkout in $InstallDir"
-  git -C $InstallDir pull --ff-only
+  # Discard any local drift (e.g. npm touching package.json) — the repo is the
+  # source of truth and a re-install must never be blocked by it.
+  Run-Capture { git -C $InstallDir checkout -- . } | Out-Null
+  Run-Capture { git -C $InstallDir pull --ff-only } | Out-Null
 } else {
   Say "cloning into $InstallDir"
   git clone --depth 1 $RepoUrl $InstallDir
@@ -145,11 +148,25 @@ $trigger = New-ScheduledTaskTrigger -AtLogOn
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero)
 $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
 
-Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
-Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings -Principal $principal | Out-Null
-Say "scheduled task '$TaskName' registered (starts at logon)"
-
-Start-ScheduledTask -TaskName $TaskName
+# Scheduled Task registration can fail with 'Access is denied' (corporate
+# policy, non-interactive token). The bridge does not strictly need the task:
+# fall back to a plain background start so the install still completes.
+$taskOk = $false
+try {
+  Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+  Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings -Principal $principal -ErrorAction Stop | Out-Null
+  $taskOk = $true
+  Say "scheduled task '$TaskName' registered (starts at logon)"
+  Start-ScheduledTask -TaskName $TaskName
+} catch {
+  Say "warn: could not register scheduled task ($($_.Exception.Message.Trim()))"
+}
+if (-not $taskOk) {
+  Say 'starting bridge in background instead (autostart disabled; start manually with: glm-bridge start)'
+  try {
+    Start-Process -WindowStyle Hidden -FilePath $node.Source -ArgumentList "`"$InstallDir\glm-bridge.js`" run" -WorkingDirectory $InstallDir
+  } catch { Say "warn: background start failed ($($_.Exception.Message.Trim())) - run: glm-bridge start" }
+}
 
 # ------------------------------------------------------------- ready -------
 Say 'waiting for the bridge to become ready...'
