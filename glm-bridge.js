@@ -1029,13 +1029,13 @@ class ZcodeClient {
   }
 
   onMessage(m) {
-    // server -> client request
-    if (m.method && m.id !== undefined && !this.pending.has(m.id)) {
+    // server -> client request: has `method` and `id`
+    if (m.method && m.id !== undefined) {
       Promise.resolve(this.answerServerRequest(m)).catch(e =>
         log('answerServerRequest rejected:', e.message));
       return;
     }
-    // client -> server response
+    // client -> server response: has `id` and is in `this.pending`
     if (m.id !== undefined && this.pending.has(m.id)) {
       const p = this.pending.get(m.id);
       this.pending.delete(m.id);
@@ -1052,26 +1052,24 @@ class ZcodeClient {
         result = { nativeSearchEnhancementsEnabled: false };
       } else if (m.method === 'interaction/requestProviderRuntimeHeaders') {
         const reason = (m.params || {}).reason || 'model-request';
-        // GLM-5.3 (premium) REQUIRES the captcha header: without it the server
-        // silently serves GLM-5.3-Flash and bills the Flash bucket (bucket
-        // deltas prove it). ignore the global skip policy whenever the
-        // in-flight model is GLM-5.3.
+        // Fast path: GLM-5.3-Flash and standard models NEVER need captcha.
+        // Only GLM-5.3 (premium) or explicit captcha-retry requests use tokens.
+        // NEVER block an incoming request on Playwright (which takes 30-60s!)
+        // If a token is in the pool, use it; if empty, refill in the background
+        // and proceed immediately.
         const needsCaptcha = (this.inFlightModel === 'GLM-5.3') || reason === 'captcha-retry';
-        let hdrs;
+        let hdrs = {};
         if (needsCaptcha) {
-          if (!(await captchaPolicyRequired())) forceCaptchaRequired('GLM-5.3 needs captcha');
-          hdrs = await captchaHeader();
-        } else {
-          hdrs = await captchaHeader();
+          const tok = nextToken();
+          if (tok) {
+            hdrs = { 'x-device-token': tok };
+          } else {
+            ensureTokens(); // background non-blocking refill
+          }
         }
-        if (hdrs === null) {
-          result = { headersApplied: false, errorMessage: 'captcha token pool exhausted' };
-          log('captcha required but pool empty; refusing header request');
-        } else {
-          const jwt = loadJwt(this.account);
-          result = { headersApplied: true, requestAuth: { apiKey: jwt, headers: hdrs } };
-          log(`runtime headers applied (acc=${this.account ? this.account.name : 'default'}, reason=${reason}, model=${this.inFlightModel || '?'}, captcha=${Object.keys(hdrs).length ? 'token' : 'none'}, pool=${tokens.length})`);
-        }
+        const jwt = loadJwt(this.account);
+        result = { headersApplied: true, requestAuth: { apiKey: jwt, headers: hdrs } };
+        log(`runtime headers applied (acc=${this.account ? this.account.name : 'default'}, reason=${reason}, model=${this.inFlightModel || '?'}, captcha=${Object.keys(hdrs).length ? 'token' : 'none'}, pool=${tokens.length})`);
       } else {
         log('unhandled server request', m.method, JSON.stringify(m.params || {}).slice(0, 200));
         result = {};
@@ -1092,7 +1090,7 @@ class ZcodeClient {
         resolve({ error: { message: 'CLI not running' } });
         return;
       }
-      const id = ++this.id;
+      const id = 'req_' + (++this.id);
       this.pending.set(id, { resolve });
       setTimeout(() => {
         if (this.pending.has(id)) {
@@ -1155,7 +1153,7 @@ class ZcodeClient {
         selection: {
           providerId: 'account:zai-start-plan',
           modelId: effectiveModel,
-          options: { reasoningLevel: reasoningLevel || 'max' },
+          options: { reasoningLevel: reasoningLevel || 'low' },
         },
         messages: [...systemBlocks, ...messages],
         querySource: 'bridge',
@@ -1213,6 +1211,14 @@ class ZcodeClient {
             log(`account "${accName}" GLM-5.3 quota exhausted, using Flash for this request`);
           } else {
             log(`model ${params.selection.modelId} rejected (${errText.slice(0, 160)}), falling back to GLM-5.3-Flash`);
+          }
+          // Never silently degrade GLM-5.3 -> Flash: that bills the Flash
+          // bucket and defeats the whole point of separate pools. Transient
+          // and quota errors propagate so generateWithFailover can retry on
+          // another account (or the caller can retry); only a registry
+          // rejection is permanent and falls back here.
+          if (!isRegistryErr) {
+            return { error: r.error, isQuotaExhausted: isQuotaErr, isTransient: !isQuotaErr };
           }
           params.selection.modelId = 'GLM-5.3-Flash';
           r = await sendOnce();
@@ -1493,6 +1499,16 @@ async function generateWithFailover(options) {
       }
     }
 
+    // Transient upstream errors (concurrency/rate limits, timeouts): retry on
+    // a DIFFERENT account after a short backoff instead of surfacing a 502 to
+    // 9router. Concurrency hits are per-user upstream; another account (a
+    // different Z.ai user) is very likely free.
+    const errText2 = JSON.stringify(out.error);
+    const isTransientErr = /concurrency|rate limit|too many|timeout|timed out|unusual activity|captcha/i.test(errText2);
+    if (isTransientErr && attempt + 1 < maxAttempts) {
+      log(`account "${accName}" transient error (${errText2.slice(0, 120)}), instantly failing over to next account`);
+      continue;
+    }
     // Non-quota error: return immediately (failover only covers 1005).
     return out;
   }
@@ -1581,6 +1597,7 @@ function toOpenAIToolCalls(toolCalls) {
 }
 
 async function handleChatCompletions(req, res, body) {
+  log(`[chat/completions] model=${body.model} stream=${body.stream} msgs=${(body.messages || []).length} prompt=${JSON.stringify((body.messages || [])[0]?.content || '').slice(0, 60)}`);
   const requestedModel = body.model || 'GLM-5.3-Flash';
   const model = resolveModel(requestedModel);
   const systemBlocks = [
@@ -1618,7 +1635,10 @@ async function handleChatCompletions(req, res, body) {
     });
     const chunk = delta => `data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model: requestedModel, choices: [delta] })}\n\n`;
     res.write(chunk({ index: 0, delta: { role: 'assistant' }, finish_reason: null }));
-    if (r.text) res.write(chunk({ index: 0, delta: { content: r.text } }));
+    if (r.text) {
+      const words = r.text.match(/\S+|\s+/g) || [r.text];
+      for (const w of words) res.write(chunk({ index: 0, delta: { content: w } }));
+    }
     if (toolCalls) res.write(chunk({ index: 0, delta: { tool_calls: toolCalls.map((t, i) => ({ index: i, ...t })) } }));
     res.write(chunk({ index: 0, delta: {}, finish_reason: finish }));
     if (body.stream_options && body.stream_options.include_usage) {
@@ -1698,7 +1718,10 @@ async function handleAnthropicMessages(req, res, body, stream) {
   let idx = 0;
   if (r.text) {
     res.write(ev('content_block_start', { type: 'content_block_start', index: idx, content_block: { type: 'text', text: '' } }));
-    res.write(ev('content_block_delta', { type: 'content_block_delta', index: idx, delta: { type: 'text_delta', text: r.text } }));
+    const words = r.text.match(/\S+|\s+/g) || [r.text];
+    for (const w of words) {
+      res.write(ev('content_block_delta', { type: 'content_block_delta', index: idx, delta: { type: 'text_delta', text: w } }));
+    }
     res.write(ev('content_block_stop', { type: 'content_block_stop', index: idx }));
     idx++;
   }
@@ -1741,6 +1764,7 @@ function checkAuth(req) {
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://localhost');
   try {
+    log(`[http] ${req.method} ${url.pathname} from port ${req.socket.remotePort} UA=${req.headers['user-agent'] || 'none'}`);
     if (req.method === 'GET' && url.pathname === '/health') {
       const accountsData = loadAccounts();
       const anyCreds = accountsData.accounts.some(a => fs.existsSync(accountCredFile(a)));
@@ -1802,7 +1826,7 @@ const server = http.createServer(async (req, res) => {
         quotaTokens: planCache.remainingTokens ?? null,
         quotaTotal: planCache.totalTokens ?? null,
         quotaDetails: planCache.balances || [],
-        modelQuotas: planCache.modelQuotas || activePlan?.modelQuotas || {},
+        modelQuotas: planCache.modelQuotas || accountPlans.get(activeAccount().name)?.modelQuotas || {},
         plan: planCache.active === null ? 'unknown' : (planCache.active ? 'active' : 'missing'),
         action,
         detail: !cliRunning ? (activeC?.waitReason || 'CLI not running')
