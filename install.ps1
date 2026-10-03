@@ -227,4 +227,9 @@ Write-Host '  TUI      : zbridge.cmd'
 Write-Host '  control  : glm-bridge.cmd start|stop|restart|status|logs'
 Write-Host "  health   : curl http://127.0.0.1:$Port/health"
 Write-Host ''
-Write-Host 'Requires a ZCode desktop login (the bridge reuses its subscription).'
+if (Find-ZcodeCli) {
+  Write-Host 'ZCode CLI detected - no desktop app required.'
+} else {
+  Write-Host 'Requires the ZCode build (bridge reuses its subscription).'
+  Write-Host 'Re-run this installer to get the download dialog (with size).'
+}

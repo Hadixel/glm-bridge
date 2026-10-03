@@ -280,18 +280,20 @@ if [ "$REGISTER_9ROUTER" != "no" ] && curl -fsS "http://127.0.0.1:20128/api/heal
 else
   [ "$REGISTER_9ROUTER" = "yes" ] && say "9router not reachable on :20128 — skipped"
 fi
+say "done"
 
-cat <<EOF
-
-$(say "done")
-
-  base URL : http://127.0.0.1:$PORT/v1
-  api key  : $KEY
-  model    : GLM-5.3-Flash
-
-  control  : glm-bridge start|stop|restart|status|logs
-  logs     : journalctl --user -u $SERVICE -f    (or: glm-bridge logs 50)
-  health   : curl http://127.0.0.1:$PORT/health
-
-Requires a ZCode desktop login (the bridge reuses its subscription).
-EOF
+echo ""
+echo "  base URL : http://127.0.0.1:$PORT/v1"
+echo "  api key  : $KEY"
+echo "  model    : GLM-5.3-Flash"
+echo ""
+echo "  control  : glm-bridge start|stop|restart|status|logs"
+echo "  logs     : journalctl --user -u $SERVICE -f    (or: glm-bridge logs 50)"
+echo "  health   : curl http://127.0.0.1:$PORT/health"
+echo ""
+if [ -f "$INSTALL_DIR/squashfs-root/resources/glm/zcode.cjs" ] || ls "$HOME"/Applications/ZCode-*.AppImage >/dev/null 2>&1; then
+  echo "ZCode CLI detected — no desktop app required."
+else
+  echo "Requires the ZCode build (bridge reuses its subscription)."
+  echo "Re-run this installer to get the download dialog (with size)."
+fi
