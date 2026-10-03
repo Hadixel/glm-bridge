@@ -19,3 +19,4 @@ tray.log
 accounts.json
 accounts/
 __pycache__/
+.omp/
