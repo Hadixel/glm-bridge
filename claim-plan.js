@@ -80,15 +80,35 @@ const JSON_OUT = args.includes('--json');
 const DRY = args.includes('--dry-run');
 const FORCE = args.includes('--force');   // claim even if a plan already looks active
 const PREVIEW_ONLY = args.includes('--preview');  // list claimable offers, no claim
-const PROXY = process.env.GLM_BRIDGE_PROXY
-  || process.env.HTTPS_PROXY || process.env.https_proxy
-  || process.env.ALL_PROXY || process.env.all_proxy
-  || getSystemProxy() || 'http://127.0.0.1:10809';
-// The captcha browser must use the SAME route as the claim request or the
-// verify param is rejected. Direct works whenever egress is up; the proxy is
-// only needed when direct is blocked, and then for both.
-const MINT_PROXY = process.env.MINT_PROXY || process.env.GLM_BRIDGE_MINT_PROXY
-  || PROXY || '';
+// The GNOME proxy (10.70.109.39:8080) comes and goes with the corporate
+// network. A dead proxy poisons BOTH the claim requests and the captcha
+// browser (ERR_PROXY_CONNECTION_FAILED), so PROBE it per-run (resolveProxy()
+// below, awaited at startup): only prefer it when direct egress is down AND
+// the proxy answers.
+let PROXY = '';
+const MINT_PROXY = process.env.MINT_PROXY || process.env.GLM_BRIDGE_MINT_PROXY || '';
+
+async function resolveProxy() {
+  if (MINT_PROXY) return MINT_PROXY;
+  const cands = [
+    process.env.GLM_BRIDGE_PROXY,
+    process.env.HTTPS_PROXY, process.env.https_proxy,
+    process.env.ALL_PROXY, process.env.all_proxy,
+    getSystemProxy(),
+  ].filter(Boolean);
+  const probe = (args) => new Promise(res => {
+    execFile('curl', ['-sS', '-o', '/dev/null', '-w', '%{http_code}', '-m', '6', ...args,
+      'https://zcode.z.ai/'], { timeout: 9000 }, (e, out) => {
+      res((Number(String(out).trim()) || 0) > 0);
+    });
+  });
+  if (await probe([])) return '';                       // direct works — no proxy
+  for (const p of cands) {
+    const url = p.startsWith('http') ? p : `http://${p}`;
+    if (await probe(['-x', url])) return url;           // first working proxy
+  }
+  return '';                                            // nothing works: try direct anyway
+}
 
 const HOME = os.homedir();
 const say = m => { if (!JSON_OUT) process.stderr.write('[claim] ' + m + '\n'); };
@@ -175,12 +195,13 @@ function loadPlaywright() {
 // Replays the desktop's exact AliyunCaptcha init. The details that matter:
 //   mode:'popup', a real HTMLButtonElement, button selector, showErrorTip:false
 // Without the button the SDK initialises but never invokes the callback.
-async function mintOnce(browser, attempt) {
-  const page = await (await browser.newContext({
+async function mintOnce(browser, attempt, opts = {}) {
+  const context = await browser.newContext({
     viewport: { width: 1380, height: 860 },
     userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36',
     locale: 'en-US',
-  })).newPage();
+  });
+  const page = await context.newPage();
   // Hide automation fingerprints the risk engine keys on.
   await page.addInitScript(() => {
     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
@@ -271,7 +292,7 @@ async function mintOnce(browser, attempt) {
     for (let i = 0; i < 20; i++) {
       await page.waitForTimeout(1000);
       const cb = await pickCb();
-      if (cb) { say('captcha param obtained traceless (attempt ' + attempt + ', ' + (i + 1) + 's)'); return cb; }
+      if (cb) { say('captcha param obtained traceless (attempt ' + attempt + ', ' + (i + 1) + 's)'); return opts.keepOpen ? { param: cb, page } : cb; }
     }
     const errs = await page.evaluate(() => (window.__cb || []).filter(x => String(x).startsWith('TRACELESS-ERR')).map(x => x.slice(0, 120)));
     if (errs.length) say('traceless error: ' + errs[0]);
@@ -291,7 +312,7 @@ async function mintOnce(browser, attempt) {
     for (let i = 0; i < 30; i++) {
       await page.waitForTimeout(1000);
       const cb = await pickCb();
-      if (cb) { say('captcha param obtained (attempt ' + attempt + ', ' + (i + 1) + 's)'); return cb; }
+      if (cb) { say('captcha param obtained (attempt ' + attempt + ', ' + (i + 1) + 's)'); return opts.keepOpen ? { param: cb, page } : cb; }
       // If the popup never opened, drive the SDK through its instance handle.
       if (i === 12) {
         const via = await page.evaluate(() => {
@@ -311,7 +332,7 @@ async function mintOnce(browser, attempt) {
 
 // The SDK intermittently completes without invoking the callback, so retry
 // with a fresh page: Aliyun hands out a new device token each time.
-async function mintParam(tries) {
+async function mintParamSession(tries) {
   const pw = loadPlaywright();
   const exe = findChromium();
   // Stealth: Aliyun risk-scores the minting browser. Headless defaults
@@ -325,17 +346,27 @@ async function mintParam(tries) {
   const browser = await pw.chromium.launch(launch);
   try {
     for (let a = 1; a <= attempts; a++) {
+      let page = null;
       try {
-        const p = await mintOnce(browser, a);
-        if (p) return p;
+        const r = await mintOnce(browser, a, { keepOpen: true });
+        if (r && r.param) return { param: r.param, page: r.page, browser };
       } catch (e) { say('attempt ' + a + ' failed: ' + e.message); }
       say('attempt ' + a + '/' + attempts + ': no captcha param');
-      if (a < attempts) await new Promise(r => setTimeout(r, 4000));
+      if (a < attempts) await new Promise(r2 => setTimeout(r2, 4000));
     }
-  } finally {
+  } catch (e) {
     await browser.close().catch(() => {});
+    throw e;
   }
+  await browser.close().catch(() => {});
   throw new Error('captcha callback never fired after ' + attempts + ' attempts');
+}
+
+// Legacy one-shot mint (closes the browser) — used by `--test-captcha`.
+async function mintParam(tries) {
+  const s = await mintParamSession(tries);
+  await s.browser.close().catch(() => {});
+  return s.param;
 }
 
 // ------------------------------------------------------------------ claim ---
@@ -437,6 +468,8 @@ async function planActive() {
 }
 
 (async () => {
+  PROXY = await resolveProxy();
+  say(PROXY ? `using proxy ${PROXY}` : 'using direct connection');
   if (PREVIEW_ONLY) {
     const prev = await previewPlans().catch(() => null);
     emit(prev === null ? { ok: false, reason: 'preview-unreachable' }
@@ -471,29 +504,63 @@ async function planActive() {
   // Proven path (2026-10-02): ONE fresh traceless param → ONE raw-json POST.
   // The param is single-use; extra encodings (signed-b64/b64-json) and extra
   // rounds only re-verify an already-consumed token → guaranteed 3007.
+  // 2026-10-03: fresh accounts now 3007 with the cross-session (curl) claim —
+  // Aliyun binds the verify param to the browser session that minted it. The
+  // claim is therefore issued INSIDE the minting page (same cookies + TLS),
+  // exactly like the GUI does; curl remains the fallback.
+  const inPageClaim = async (page, planId) => {
+    const jwt = zcodeJwt();
+    return page.evaluate(async ({ jwt, planId }) => {
+      const r = await fetch('/api/v1/zcode-plan/billing/claim', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer ' + jwt,
+          'X-Aliyun-Captcha-Verify-Region': 'sgp',
+          'X-Aliyun-Captcha-Verify-Param': window.__captchaParam || '',
+        },
+        credentials: 'include',
+        body: JSON.stringify({ plan_id: planId }),
+      });
+      return { status: r.status, body: await r.text() };
+    }, { jwt, planId });
+  };
+
+  // mintParam must also keep the page open for the in-page claim: extend it to
+  // return { param, page, browser } when a claim callback is provided.
   const results = [];
   for (const t of targets) {
     let claimed = false; let lastErr = null;
     for (let attempt = 0; attempt < 2 && !claimed; attempt++) {
       if (attempt > 0) { say('waiting 15s before re-mint (verify rate window)...'); await new Promise(r => setTimeout(r, 15000)); }
-      let param;
       say(`minting captcha param for ${t.planId} (attempt ${attempt + 1})...`);
-      try { param = await mintParam(); }
-      catch (e) { lastErr = 'captcha mint failed: ' + e.message; say(lastErr); continue; }
-      if (process.env.GLM_BRIDGE_DEBUG === '1') say('param: ' + String(param).slice(0, 300));
-      const res = await claim(String(param), t.planId);
-      say(`raw-json -> HTTP ${res.status} ${String(res.body).slice(0, 220)}`);
+      let minted = null;
+      try {
+        minted = await mintParamSession();   // { param, page, browser } — page stays open
+      } catch (e) { lastErr = 'captcha mint failed: ' + e.message; say(lastErr); continue; }
+      const { param, page, browser } = minted;
+      let res = null;
+      try {
+        await page.evaluate(p => { window.__captchaParam = p; }, param);
+        res = await inPageClaim(page, t.planId);
+        say(`in-page claim -> HTTP ${res.status} ${String(res.body).slice(0, 200)}`);
+      } catch (e) {
+        say('in-page claim failed (' + e.message + '), falling back to curl');
+      }
+      if (!res || !(res.status === 200 && /"code"\s*:\s*0/.test(String(res.body)))) {
+        res = await claim(param, t.planId);
+        say(`raw-json (curl) -> HTTP ${res.status} ${String(res.body).slice(0, 200)}`);
+      }
+      await browser.close().catch(() => {});
       if (res.status === 200 && /"code"\s*:\s*0/.test(String(res.body))) {
         claimed = true;
-        emit({ ok: true, claimed: true, planId: t.planId,
-          detail: String(res.body).slice(0, 500) });
+        emit({ ok: true, claimed: true, planId: t.planId, detail: String(res.body).slice(0, 500) });
       } else if (/"code"\s*:\s*1001/.test(String(res.body))) {
         results.push({ planId: t.planId, ok: true, claimed: false, reason: 'target-gone' });
         say('offer vanished (1001) — nothing more to do for this target');
         break;
       } else {
         lastErr = `HTTP ${res.status} ${String(res.body).slice(0, 220)}`;
-        // 3007 on attempt 1 → one fresh re-mint after the rate window
       }
     }
     if (claimed) return;
