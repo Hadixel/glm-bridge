@@ -1098,6 +1098,13 @@ class ZcodeClient {
           this.pending.delete(id);
           const elapsed = Date.now() - tStart;
           log(`[send TIMEOUT acc=${this.account ? this.account.name : '?'}] ${id} ${method} elapsed=${elapsed}ms timeoutMs=${timeoutMs}`);
+          try {
+            if (this.child) {
+              log(`killing hung child CLI for "${this.account ? this.account.name : '?'}" (PID ${this.child.pid})`);
+              this.ready = false;
+              this.child.kill('SIGKILL');
+            }
+          } catch {}
           resolve({ error: { message: `timeout waiting for ${method}` } });
         }
       }, timeoutMs);
@@ -1172,7 +1179,7 @@ class ZcodeClient {
         };
         signal.addEventListener('abort', onAbort, { once: true });
       }
-      const sendOnce = () => this.send('workspace/generateText', params, 300_000);
+      const sendOnce = () => this.send('workspace/generateText', params, 75_000);
       let r;
       try {
         r = await sendOnce();
@@ -1243,7 +1250,7 @@ class ZcodeClient {
         log('empty length-truncated response, retrying with maxOutputTokens=8192');
         params.maxOutputTokens = 8192;
         params.operationId = 'op-' + crypto.randomUUID();
-        const r2 = await this.send('workspace/generateText', params, 300_000);
+        const r2 = await this.send('workspace/generateText', params, 75_000);
         if (r2.result) result = r2.result;
         else if (r2.error) return { error: r2.error };
       }
@@ -1405,9 +1412,11 @@ function getNextClient(excludeNames = new Set(), requestedModel = null) {
   const usable = allUsable.filter(a => {
     if (excludeNames.has(a.name)) return false;
     if (requestedModel && !accountHasModelTokens(a.name, requestedModel)) return false;
+    const c = clientPool.get(a.name);
+    if (c && !c.ready) return false;
     return true;
   });
-
+  const finalUsable = usable.length ? usable : allUsable.filter(a => !excludeNames.has(a.name));
   if (!usable.length) {
     // If all usable accounts are excluded or none usable, try any logged-in account not excluded
     const all = loadAccounts().accounts.filter(a => fs.existsSync(accountCredFile(a)));
@@ -1418,25 +1427,25 @@ function getNextClient(excludeNames = new Set(), requestedModel = null) {
 
   if (routing === 'fill-first') {
     const active = activeAccount();
-    const actUsable = usable.find(x => x.name === active.name);
-    return getClientForAccount(actUsable || usable[0]);
+    const actUsable = finalUsable.find(x => x.name === active.name);
+    return getClientForAccount(actUsable || finalUsable[0]);
   }
 
   // Least-busy load balancing across usable accounts:
   // Routes traffic away from accounts currently processing heavy multi-turn prompts
   // (e.g. Claude Code 150k contexts) to completely idle accounts.
-  let best = usable[0];
+  let best = finalUsable[0];
   let minActive = Infinity;
-  for (let i = 0; i < usable.length; i++) {
-    const idx = (roundRobinIdx + i) % usable.length;
-    const acc = usable[idx];
+  for (let i = 0; i < finalUsable.length; i++) {
+    const idx = (roundRobinIdx + i) % finalUsable.length;
+    const acc = finalUsable[idx];
     const c = clientPool.get(acc.name);
     const active = c ? (c.activeRequests || 0) : 0;
     if (active < minActive) {
       minActive = active;
       best = acc;
       if (active === 0) {
-        roundRobinIdx = (idx + 1) % usable.length;
+        roundRobinIdx = (idx + 1) % finalUsable.length;
         break; // Found an idle account, dispatch immediately!
       }
     }
