@@ -1201,7 +1201,14 @@ class ZcodeClient {
       let onAbort = null;
       if (signal) {
         onAbort = () => {
-          this.send('workspace/cancelGenerateText', { operationId: opId }).catch(() => {});
+          // Fire-and-forget: the child may be busy streaming a huge prompt, so
+          // the cancel ack can legitimately take longer than any timeout here.
+          // Killing the CLI over a slow cancel would destroy an in-flight
+          // generation for other waiters — just deliver the cancel best-effort.
+          try {
+            const id = 'req_' + (++this.id);
+            this.child?.stdin?.write(JSON.stringify({ id, method: 'workspace/cancelGenerateText', params: { operationId: opId } }) + '\n');
+          } catch { /* child gone; nothing to cancel */ }
         };
         signal.addEventListener('abort', onAbort, { once: true });
       }
@@ -1506,18 +1513,39 @@ async function generateWithFailover(options) {
   const allAccounts = loadAccounts().accounts.filter(a => fs.existsSync(accountCredFile(a)));
   const maxAttempts = Math.max(1, allAccounts.length);
   let lastOut = null;
+  // Wait for an idle CLI slot before dispatching.  When all accounts are
+  // busy, queuing inside zcode.cjs blocks the whole process (sequential
+  // message queue).  Instead, poll briefly for a free slot.
+  const waitForSlot = async (signal) => {
+    for (let i = 0; i < 150; i++) {  // up to ~150s
+      if (signal && signal.aborted) return;
+      for (const [, c] of clientPool) {
+        if (c.ready && (c.activeRequests || 0) === 0) return;
+      }
+      await new Promise(r => setTimeout(r, 1000));
+    }
+  };
 
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     if (options.signal && options.signal.aborted) {
       log('request already aborted by client, skipping failover');
       return lastOut || { error: { message: 'request aborted by client' } };
     }
+    // If all CLIs are busy, wait for one to free up rather than queuing
+    // inside zcode.cjs where it blocks the sequential message pump.
+    const allBusy = [...clientPool.values()].every(c => !c.ready || (c.activeRequests || 0) > 0);
+    if (allBusy && attempt === 0) {
+      log('all CLI slots busy, waiting for idle slot...');
+      await waitForSlot(options.signal);
+      if (options.signal && options.signal.aborted) {
+        return { error: { message: 'request aborted by client' } };
+      }
+    }
     const c = getNextClient(triedAccounts, requestedModel);
     if (!c) break;
     const accName = (c && c.account) ? c.account.name : activeAccount().name;
     triedAccounts.add(accName);
     log(`dispatching request to account "${accName}" (mode: ${getRoutingMode()})`);
-
     let out = await c.generate(options);
     if (options.signal && options.signal.aborted) {
       log(`request aborted by client (acc=${accName}), stopping failover`);
