@@ -1042,7 +1042,7 @@ class ZcodeClient {
       p.resolve(m);
       return;
     }
-    // notifications: state.updated etc. — ignored (generateText is request/response)
+    // notifications: state.updated, storageState, mcpTelemetry — ignored
   }
 
   async answerServerRequest(m) {
@@ -1091,10 +1091,13 @@ class ZcodeClient {
         return;
       }
       const id = 'req_' + (++this.id);
+      const tStart = Date.now();
       this.pending.set(id, { resolve });
       setTimeout(() => {
         if (this.pending.has(id)) {
           this.pending.delete(id);
+          const elapsed = Date.now() - tStart;
+          log(`[send TIMEOUT acc=${this.account ? this.account.name : '?'}] ${id} ${method} elapsed=${elapsed}ms timeoutMs=${timeoutMs}`);
           resolve({ error: { message: `timeout waiting for ${method}` } });
         }
       }, timeoutMs);
