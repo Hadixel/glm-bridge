@@ -1629,6 +1629,55 @@ async function handleChatCompletions(req, res, body) {
   const messages = openaiToZcode((body.messages || []).filter(m => m.role !== 'system'));
   if (!messages.length) return sendJson(res, 400, { error: { message: 'messages required', type: 'invalid_request_error' } });
 
+  const created = Math.floor(Date.now() / 1000);
+  const id = 'chatcmpl-' + crypto.randomUUID();
+
+  if (body.stream) {
+    res.writeHead(200, {
+      'content-type': 'text/event-stream; charset=utf-8',
+      'cache-control': 'no-cache',
+      'connection': 'keep-alive',
+      'x-accel-buffering': 'no',
+    });
+    const chunk = delta => `data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model: requestedModel, choices: [delta] })}\n\n`;
+    res.write(chunk({ index: 0, delta: { role: 'assistant' }, finish_reason: null }));
+
+    const out = await generateWithFailover({
+      systemBlocks,
+      messages,
+      tools: openaiToolDefs(body.tools),
+      maxOutputTokens: clampMaxTokens(body.max_tokens ?? body.max_completion_tokens),
+      reasoningLevel: reasoningFromRequest(body),
+      modelId: model,
+      signal: req.signal,
+    });
+    if (out.error) {
+      res.write(`data: ${JSON.stringify({ error: { message: `upstream: ${out.error.message || JSON.stringify(out.error)}`, type: 'upstream_error' } })}\n\n`);
+      res.write('data: [DONE]\n\n');
+      res.end();
+      return;
+    }
+    const r = out.result || {};
+    const toolCalls = (r.toolCalls && r.toolCalls.length) ? toOpenAIToolCalls(r.toolCalls) : null;
+    const usage = r.usage || {};
+    const finish = toolCalls ? 'tool_calls' : (r.finishReason === 'stop' || !r.finishReason ? 'stop' : r.finishReason);
+
+    if (r.text) {
+      const words = r.text.match(/\S+|\s+/g) || [r.text];
+      for (const w of words) res.write(chunk({ index: 0, delta: { content: w } }));
+    }
+    if (toolCalls) res.write(chunk({ index: 0, delta: { tool_calls: toolCalls.map((t, i) => ({ index: i, ...t })) } }));
+    res.write(chunk({ index: 0, delta: {}, finish_reason: finish }));
+    if (body.stream_options && body.stream_options.include_usage) {
+      res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model: requestedModel, choices: [], usage: {
+        prompt_tokens: usage.inputTokens || 0, completion_tokens: usage.outputTokens || 0, total_tokens: usage.totalTokens || 0,
+      } })}\n\n`);
+    }
+    res.write('data: [DONE]\n\n');
+    res.end();
+    return;
+  }
+
   const out = await generateWithFailover({
     systemBlocks,
     messages,
@@ -1647,32 +1696,6 @@ async function handleChatCompletions(req, res, body) {
   const message = { role: 'assistant', content: r.text || '' };
   if (toolCalls) message.tool_calls = toolCalls;
   const finish = toolCalls ? 'tool_calls' : (r.finishReason === 'stop' || !r.finishReason ? 'stop' : r.finishReason);
-  const created = Math.floor(Date.now() / 1000);
-  const id = 'chatcmpl-' + crypto.randomUUID();
-
-  if (body.stream) {
-    res.writeHead(200, {
-      'content-type': 'text/event-stream; charset=utf-8',
-      'cache-control': 'no-cache', connection: 'keep-alive',
-    });
-    const chunk = delta => `data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model: requestedModel, choices: [delta] })}\n\n`;
-    res.write(chunk({ index: 0, delta: { role: 'assistant' }, finish_reason: null }));
-    if (r.text) {
-      const words = r.text.match(/\S+|\s+/g) || [r.text];
-      for (const w of words) res.write(chunk({ index: 0, delta: { content: w } }));
-    }
-    if (toolCalls) res.write(chunk({ index: 0, delta: { tool_calls: toolCalls.map((t, i) => ({ index: i, ...t })) } }));
-    res.write(chunk({ index: 0, delta: {}, finish_reason: finish }));
-    if (body.stream_options && body.stream_options.include_usage) {
-      res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model: requestedModel, choices: [], usage: {
-        prompt_tokens: usage.inputTokens || 0, completion_tokens: usage.outputTokens || 0, total_tokens: usage.totalTokens || 0,
-      } })}\n\n`);
-    }
-    res.write('data: [DONE]\n\n');
-    res.end();
-    return;
-  }
-
   sendJson(res, 200, {
     id, object: 'chat.completion', created, model: requestedModel,
     choices: [{ index: 0, message, finish_reason: finish }],
@@ -1695,6 +1718,70 @@ async function handleAnthropicMessages(req, res, body, stream) {
   const messages = anthropicToZcode(body);
   if (!messages.length) return sendJson(res, 400, { type: 'error', error: { type: 'invalid_request_error', message: 'messages required' } });
 
+  const id = 'msg_' + crypto.randomUUID().replace(/-/g, '').slice(0, 24);
+  const created = Math.floor(Date.now() / 1000);
+
+  if (stream) {
+    res.writeHead(200, {
+      'content-type': 'text/event-stream; charset=utf-8',
+      'cache-control': 'no-cache',
+      'connection': 'keep-alive',
+      'x-accel-buffering': 'no',
+    });
+    const ev = (event, data) => `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+    res.write(ev('message_start', { type: 'message_start', message: {
+      id, type: 'message', role: 'assistant', model: requestedModel, content: [],
+      stop_reason: null, stop_sequence: null,
+      usage: { input_tokens: 0, output_tokens: 0 },
+    } }));
+
+    const out = await generateWithFailover({
+      systemBlocks,
+      messages,
+      tools: openaiToolDefs((body.tools || []).map(t => ({
+        type: 'function',
+        function: { name: t.name, description: t.description, parameters: t.input_schema },
+      }))),
+      maxOutputTokens: clampMaxTokens(body.max_tokens),
+      reasoningLevel: reasoningFromRequest(body),
+      modelId: resolveModel(requestedModel),
+      signal: req.signal,
+    });
+    if (out.error) {
+      res.write(ev('error', { type: 'error', error: { type: 'api_error', message: `upstream: ${out.error.message || JSON.stringify(out.error)}` } }));
+      res.end();
+      return;
+    }
+    const r = out.result || {};
+    const stopReason = (r.toolCalls && r.toolCalls.length) ? 'tool_use' : 'end_turn';
+    const usage = r.usage || {};
+    let idx = 0;
+    if (r.text) {
+      res.write(ev('content_block_start', { type: 'content_block_start', index: idx, content_block: { type: 'text', text: '' } }));
+      const words = r.text.match(/\S+|\s+/g) || [r.text];
+      for (const w of words) {
+        res.write(ev('content_block_delta', { type: 'content_block_delta', index: idx, delta: { type: 'text_delta', text: w } }));
+      }
+      res.write(ev('content_block_stop', { type: 'content_block_stop', index: idx }));
+      idx++;
+    }
+    for (const t of (r.toolCalls || [])) {
+      res.write(ev('content_block_start', { type: 'content_block_start', index: idx, content_block: { type: 'tool_use', id: t.id, name: t.name, input: {} } }));
+      res.write(ev('content_block_delta', { type: 'content_block_delta', index: idx, delta: { type: 'input_json_delta', partial_json: JSON.stringify(t.input || {}) } }));
+      res.write(ev('content_block_stop', { type: 'content_block_stop', index: idx }));
+      idx++;
+    }
+    if (idx === 0) {
+      res.write(ev('content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }));
+      res.write(ev('content_block_stop', { type: 'content_block_stop', index: 0 }));
+    }
+    res.write(ev('message_delta', { type: 'message_delta', delta: { stop_reason: stopReason, stop_sequence: null },
+      usage: { output_tokens: usage.outputTokens || 0 } }));
+    res.write(ev('message_stop', { type: 'message_stop' }));
+    res.end();
+    return;
+  }
+
   const out = await generateWithFailover({
     systemBlocks,
     messages,
@@ -1716,51 +1803,11 @@ async function handleAnthropicMessages(req, res, body, stream) {
   for (const t of (r.toolCalls || [])) content.push({ type: 'tool_use', id: t.id, name: t.name, input: t.input || {} });
   const stopReason = (r.toolCalls && r.toolCalls.length) ? 'tool_use' : 'end_turn';
   const usage = r.usage || {};
-  const id = 'msg_' + crypto.randomUUID().replace(/-/g, '').slice(0, 24);
-  const created = Math.floor(Date.now() / 1000);
-
-  if (!stream) {
-    return sendJson(res, 200, {
-      id, type: 'message', role: 'assistant', model: requestedModel,
-      content, stop_reason: stopReason, stop_sequence: null,
-      usage: { input_tokens: usage.inputTokens || 0, output_tokens: usage.outputTokens || 0 },
-    });
-  }
-
-  res.writeHead(200, {
-    'content-type': 'text/event-stream; charset=utf-8',
-    'cache-control': 'no-cache', connection: 'keep-alive',
+  return sendJson(res, 200, {
+    id, type: 'message', role: 'assistant', model: requestedModel,
+    content, stop_reason: stopReason, stop_sequence: null,
+    usage: { input_tokens: usage.inputTokens || 0, output_tokens: usage.outputTokens || 0 },
   });
-  const ev = (event, data) => `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
-  res.write(ev('message_start', { type: 'message_start', message: {
-    id, type: 'message', role: 'assistant', model: requestedModel, content: [],
-    stop_reason: null, stop_sequence: null,
-    usage: { input_tokens: usage.inputTokens || 0, output_tokens: 0 },
-  } }));
-  let idx = 0;
-  if (r.text) {
-    res.write(ev('content_block_start', { type: 'content_block_start', index: idx, content_block: { type: 'text', text: '' } }));
-    const words = r.text.match(/\S+|\s+/g) || [r.text];
-    for (const w of words) {
-      res.write(ev('content_block_delta', { type: 'content_block_delta', index: idx, delta: { type: 'text_delta', text: w } }));
-    }
-    res.write(ev('content_block_stop', { type: 'content_block_stop', index: idx }));
-    idx++;
-  }
-  for (const t of (r.toolCalls || [])) {
-    res.write(ev('content_block_start', { type: 'content_block_start', index: idx, content_block: { type: 'tool_use', id: t.id, name: t.name, input: {} } }));
-    res.write(ev('content_block_delta', { type: 'content_block_delta', index: idx, delta: { type: 'input_json_delta', partial_json: JSON.stringify(t.input || {}) } }));
-    res.write(ev('content_block_stop', { type: 'content_block_stop', index: idx }));
-    idx++;
-  }
-  if (idx === 0) { // empty response still needs one block
-    res.write(ev('content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }));
-    res.write(ev('content_block_stop', { type: 'content_block_stop', index: 0 }));
-  }
-  res.write(ev('message_delta', { type: 'message_delta', delta: { stop_reason: stopReason, stop_sequence: null },
-    usage: { output_tokens: usage.outputTokens || 0 } }));
-  res.write(ev('message_stop', { type: 'message_stop' }));
-  res.end();
 }
 
 function readBody(req) {
