@@ -1696,6 +1696,11 @@ async function handleChatCompletions(req, res, body) {
       signal: req.signal,
     });
     if (out.error) {
+      if (req.signal && req.signal.aborted) {
+        log('client aborted; terminating stream without 502');
+        res.destroy();
+        return;
+      }
       res.write(`data: ${JSON.stringify({ error: { message: `upstream: ${out.error.message || JSON.stringify(out.error)}`, type: 'upstream_error' } })}\n\n`);
       res.write('data: [DONE]\n\n');
       res.end();
@@ -1732,6 +1737,11 @@ async function handleChatCompletions(req, res, body) {
     signal: req.signal,
   });
   if (out.error) {
+    if (req.signal && req.signal.aborted) {
+      log('client aborted; terminating connection without 502');
+      res.destroy();
+      return;
+    }
     return sendJson(res, 502, { error: { message: `upstream: ${out.error.message || JSON.stringify(out.error)}`, type: 'upstream_error' } });
   }
   const r = out.result || {};
@@ -1839,6 +1849,11 @@ async function handleAnthropicMessages(req, res, body, stream) {
     signal: req.signal,
   });
   if (out.error) {
+    if (req.signal && req.signal.aborted) {
+      log('client aborted; terminating connection without 502');
+      res.destroy();
+      return;
+    }
     return sendJson(res, 502, { type: 'error', error: { type: 'api_error', message: `upstream: ${out.error.message || JSON.stringify(out.error)}` } });
   }
   const r = out.result || {};
