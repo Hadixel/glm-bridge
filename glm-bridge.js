@@ -215,7 +215,7 @@ function loadConfig() {
   }
   c.port = Number(process.env.GLM_BRIDGE_PORT || c.port || 3010);
   if (process.env.GLM_BRIDGE_KEY) c.key = process.env.GLM_BRIDGE_KEY;
-  c.routing = process.env.GLM_BRIDGE_ROUTING || c.routing || 'round-robin';
+  c.routing = process.env.GLM_BRIDGE_ROUTING || c.routing || 'session-pin';
   return c;
 }
 function saveConfig(c) {
@@ -223,11 +223,11 @@ function saveConfig(c) {
 }
 function getRoutingMode() {
   const cfg = loadConfig();
-  return process.env.GLM_BRIDGE_ROUTING || cfg.routing || 'round-robin';
+  return process.env.GLM_BRIDGE_ROUTING || cfg.routing || 'session-pin';
 }
 function setRoutingMode(mode) {
-  if (!['round-robin', 'fill-first'].includes(mode)) {
-    throw new Error('Routing mode must be "round-robin" or "fill-first"');
+  if (!['round-robin', 'fill-first', 'session-pin'].includes(mode)) {
+    throw new Error('Routing mode must be "round-robin", "fill-first" or "session-pin"');
   }
   const cfg = loadConfig();
   cfg.routing = mode;
@@ -1427,6 +1427,57 @@ function parseJsonSafe(s) {
 // ------------------------------------------------------------- HTTP layer ----
 // Lazy: control commands (status/stop/logs) must not boot the whole runtime.
 const clientPool = new Map();
+
+// ------------------------------------------------------ session pinning ----
+// Pin each client TCP connection (source port) to one account so concurrent
+// sessions never share a CLI slot. zcode.cjs processes messages sequentially
+// per CLI, so two sessions on one CLI block each other for the whole
+// generateText duration.
+const sessionPins = new Map();          // remotePort -> { name, at }
+const SESSION_PIN_TTL_MS = 30 * 60_000; // reclaim idle pins after 30 min
+
+function pinnedAccountFor(remotePort) {
+  const pin = sessionPins.get(remotePort);
+  if (pin && Date.now() - pin.at < SESSION_PIN_TTL_MS) {
+    pin.at = Date.now();
+    return pin.name;
+  }
+  return null;
+}
+
+function pinSession(remotePort, accountName) {
+  // evict stale pins so the map cannot grow unbounded
+  const now = Date.now();
+  for (const [k, v] of sessionPins) if (now - v.at > SESSION_PIN_TTL_MS) sessionPins.delete(k);
+  sessionPins.set(remotePort, { name: accountName, at: now });
+}
+
+function pinBusy(accountName) {
+  const c = clientPool.get(accountName);
+  return !c || !c.ready || (c.activeRequests || 0) > 0;
+}
+
+// Returns an account name for this session, or null to use the standard picker.
+function accountForSession(remotePort, requestedModel) {
+  // 1. Already pinned -> reuse it if the CLI is free.
+  const pinned = pinnedAccountFor(remotePort);
+  if (pinned && !pinBusy(pinned)) return pinned;
+  // 2. Pin to the idle account carrying the fewest sessions.
+  const usable = getUsableAccounts().filter(a => {
+    const c = clientPool.get(a.name);
+    return c && c.ready && (c.activeRequests || 0) === 0;
+  });
+  const candidates = usable.filter(a => accountHasModelTokens(a.name, requestedModel));
+  const pool = candidates.length ? candidates : usable;
+  if (pool.length) {
+    const pinLoad = name => [...sessionPins.values()].filter(p => p.name === name).length;
+    const picked = pool.reduce((best, a) => (pinLoad(a.name) < pinLoad(best.name) ? a : best));
+    pinSession(remotePort, picked.name);
+    return picked.name;
+  }
+  // 3. Nothing idle: fall back to the standard picker (wait-for-slot logic).
+  return null;
+}
 function getClientForAccount(acc) {
   if (!acc) acc = activeAccount();
   let c = clientPool.get(acc.name);
@@ -1509,6 +1560,8 @@ function respawnClientPool() {
 
 async function generateWithFailover(options) {
   const requestedModel = options.modelId || 'GLM-5.3-Flash';
+  const routing = getRoutingMode();
+  const reqRemotePort = options.sessionPort || null;
   const triedAccounts = new Set();
   const allAccounts = loadAccounts().accounts.filter(a => fs.existsSync(accountCredFile(a)));
   const maxAttempts = Math.max(1, allAccounts.length);
@@ -1541,7 +1594,18 @@ async function generateWithFailover(options) {
         return { error: { message: 'request aborted by client' } };
       }
     }
-    const c = getNextClient(triedAccounts, requestedModel);
+    const c = (routing === 'session-pin' && reqRemotePort)
+      ? (() => {
+          const pinnedName = accountForSession(reqRemotePort, requestedModel);
+          if (pinnedName) {
+            const acc = allAccounts.find(a => a.name === pinnedName) || { name: pinnedName };
+            triedAccounts.add(pinnedName);
+            log(`dispatching request to pinned account "${pinnedName}" (session ${reqRemotePort})`);
+            return getClientForAccount(acc);
+          }
+          return getNextClient(triedAccounts, requestedModel);
+        })()
+      : getNextClient(triedAccounts, requestedModel);
     if (!c) break;
     const accName = (c && c.account) ? c.account.name : activeAccount().name;
     triedAccounts.add(accName);
@@ -1722,6 +1786,7 @@ async function handleChatCompletions(req, res, body) {
       reasoningLevel: reasoningFromRequest(body),
       modelId: model,
       signal: req.signal,
+      sessionPort: req.socket.remotePort,
     });
     if (out.error) {
       if (req.signal && req.signal.aborted) {
@@ -1763,6 +1828,7 @@ async function handleChatCompletions(req, res, body) {
     reasoningLevel: reasoningFromRequest(body),
     modelId: model,
     signal: req.signal,
+    sessionPort: req.socket.remotePort,
   });
   if (out.error) {
     if (req.signal && req.signal.aborted) {
@@ -1875,6 +1941,7 @@ async function handleAnthropicMessages(req, res, body, stream) {
     reasoningLevel: reasoningFromRequest(body),
     modelId: resolveModel(requestedModel),
     signal: req.signal,
+    sessionPort: req.socket.remotePort,
   });
   if (out.error) {
     if (req.signal && req.signal.aborted) {
