@@ -20,6 +20,11 @@
  *   GLM_BRIDGE_PORT   default 3010
  *   GLM_BRIDGE_KEY    default auto-generated into config.json
  *   GLM_BRIDGE_CLI    override path to zcode.cjs
+ *   GLM_BRIDGE_WORKERS        CLI processes per account (default 4; 1 = old behaviour)
+ *   GLM_BRIDGE_WARM           workers kept warm per account (default 2)
+ *   GLM_BRIDGE_RETRIES        transient-error retries per request (default 8)
+ *   GLM_BRIDGE_QUEUE_TIMEOUT_MS  max wait for a free worker (default 240000)
+ *   GLM_BRIDGE_TIMEOUT_MS     max upstream time for one generation (default 300000)
  */
 'use strict';
 
@@ -51,7 +56,11 @@ const ACCOUNTS_PATH = path.join(STATE_DIR, 'accounts.json');
 // <dir>/.zcode/v2/credentials.json. The first account ("main") uses $HOME, so
 // existing single-account installs keep working unchanged. Multiple accounts
 // each carry their own 100M/day start plan — the bridge rotates on quota.
+let accountsCache = null;
 function loadAccounts() {
+  // Called many times per request; re-reading+parsing the file each time was
+  // pure overhead. External edits (glm-bridge use/login) are picked up <2s.
+  if (accountsCache && Date.now() - accountsCache.at < 1500) return accountsCache.data;
   let a = null;
   try { a = JSON.parse(fs.readFileSync(ACCOUNTS_PATH, 'utf8')); } catch { /* first run */ }
   if (!a || !Array.isArray(a.accounts) || !a.accounts.length) {
@@ -73,12 +82,24 @@ function loadAccounts() {
     a.active = a.accounts[0].name;
     changed = true;
   }
+  accountsCache = { at: Date.now(), data: a };
   if (changed) {
     try { saveAccounts(a); } catch {}
   }
   return a;
 }
-function saveAccounts(a) { fs.writeFileSync(ACCOUNTS_PATH, JSON.stringify(a, null, 2)); }
+function saveAccounts(a) {
+  const body = JSON.stringify(a, null, 2);
+  const tmp = ACCOUNTS_PATH + '.tmp-' + process.pid;
+  try {
+    fs.writeFileSync(tmp, body);
+    fs.renameSync(tmp, ACCOUNTS_PATH);
+  } catch {
+    try { fs.rmSync(tmp, { force: true }); } catch { /* ignore */ }
+    fs.writeFileSync(ACCOUNTS_PATH, body);
+  }
+  accountsCache = { at: Date.now(), data: a };
+}
 function activeAccount() {
   const a = loadAccounts();
   return a.accounts.find(x => x.name === a.active) || a.accounts[0];
@@ -128,7 +149,11 @@ function clearAccountExhaustion(name) {
 // Per-model capacity check for smart routing: an account is usable for a
 // given model if ANY bucket covering that model still has tokens left
 // (e.g. hadij: drained 100M Flash pool but leftover GLM-5.3 daily tokens).
+const modelBlocks = new Map();   // "account|model" -> blocked until (ms)
+function blockModel(accName, model, ms) { modelBlocks.set(accName + '|' + model, Date.now() + ms); }
 function accountHasModelTokens(accName, requestedModel) {
+  const until = modelBlocks.get(accName + '|' + requestedModel);
+  if (until && until > Date.now()) return false;
   const plan = accountPlans.get(accName);
   if (!plan || plan.err) return true;  // unknown -> let it try
   const mq = plan.modelQuotas || {};
@@ -199,11 +224,29 @@ const APPIMAGE = (() => {
 
 fs.mkdirSync(STATE_DIR, { recursive: true });
 
+let logBuf = [];
+let logTimer = null;
+function flushLog(sync = false) {
+  if (logTimer) { clearTimeout(logTimer); logTimer = null; }
+  if (!logBuf.length) return;
+  const data = logBuf.join('');
+  logBuf = [];
+  if (sync) { try { fs.appendFileSync(LOG_PATH, data); } catch { /* ignore */ } }
+  else fs.appendFile(LOG_PATH, data, () => {});
+}
+function rotateLogIfBig() {
+  try { if (fs.statSync(LOG_PATH).size > 8 * 1024 * 1024) fs.renameSync(LOG_PATH, LOG_PATH + '.1'); } catch { /* none yet */ }
+}
+// Never block the event loop on disk for every log line (it runs several
+// times per request, on the same thread that serves every session).
 function log(...a) {
   const line = `[${new Date().toISOString()}] ${a.join(' ')}\n`;
-  try { fs.appendFileSync(LOG_PATH, line); } catch { /* ignore */ }
+  logBuf.push(line);
+  if (logBuf.length >= 200) flushLog();
+  else if (!logTimer) { logTimer = setTimeout(() => flushLog(), 300); if (logTimer.unref) logTimer.unref(); }
   if (process.env.GLM_BRIDGE_QUIET !== '1') process.stdout.write(line);
 }
+process.on('exit', () => flushLog(true));
 
 function loadConfig() {
   let c = {};
@@ -221,9 +264,13 @@ function loadConfig() {
 function saveConfig(c) {
   fs.writeFileSync(CONFIG_PATH, JSON.stringify(c, null, 2));
 }
+let routingCache = { at: 0, mode: null };
 function getRoutingMode() {
+  if (process.env.GLM_BRIDGE_ROUTING) return process.env.GLM_BRIDGE_ROUTING;
+  if (routingCache.mode && Date.now() - routingCache.at < 5000) return routingCache.mode;
   const cfg = loadConfig();
-  return process.env.GLM_BRIDGE_ROUTING || cfg.routing || 'session-pin';
+  routingCache = { at: Date.now(), mode: cfg.routing || 'session-pin' };
+  return routingCache.mode;
 }
 function setRoutingMode(mode) {
   if (!['round-robin', 'fill-first', 'session-pin'].includes(mode)) {
@@ -232,6 +279,7 @@ function setRoutingMode(mode) {
   const cfg = loadConfig();
   cfg.routing = mode;
   saveConfig(cfg);
+  routingCache.at = 0;
   log(`routing mode set to: ${mode}`);
   return mode;
 }
@@ -285,22 +333,31 @@ function nextToken() {
   if (tokens.length === 0) return null;
   const t = tokens.shift();
   saveTokens();
+  if (tokens.length < 4) setImmediate(() => ensureTokens());   // keep the pool warm
   return t;
 }
+let mintFailStreak = 0;
+let mintBlockedUntil = 0;
 function ensureTokens(background = true) {
   if (minting || tokens.length >= 8) return;
+  if (Date.now() < mintBlockedUntil) return;     // backing off after failed mints
   if (!fs.existsSync(MINT_SCRIPT)) { log('mint script missing:', MINT_SCRIPT); return; }
   minting = true;
   const out = path.join(STATE_DIR, `tokens-mint-${Date.now()}.json`);
   const p = spawn(process.execPath, [MINT_SCRIPT, '10', out],
     { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, ...proxyEnv() } });
+  // Chromium minting is CPU heavy: never let it compete with live requests.
+  try { os.setPriority(p.pid, 10); } catch { /* best effort */ }
   p.stdout.on('data', d => log('[mint]', String(d).trim()));
   p.stderr.on('data', d => log('[mint:err]', String(d).trim().slice(0, 300)));
+  p.on('error', e => { log('[mint:spawn]', e.message); minting = false; });
   p.on('exit', code => {
     minting = false;
+    let got = 0;
     try {
       const fresh = JSON.parse(fs.readFileSync(out, 'utf8'));
       if (Array.isArray(fresh) && fresh.length) {
+        got = fresh.length;
         loadTokens();
         tokens = [...new Set([...tokens, ...fresh])];
         saveTokens();
@@ -308,9 +365,15 @@ function ensureTokens(background = true) {
       }
       fs.rmSync(out, { force: true });
     } catch (e) { log('mint merge failed:', e.message); }
-    if (tokens.length < 4) setTimeout(() => ensureTokens(), 2000);
+    if (got) mintFailStreak = 0; else mintFailStreak++;
+    if (tokens.length < 4) {
+      // Failed mints used to retry every 2s forever, burning CPU on a
+      // Chromium launch each time. Back off exponentially (max 10 min).
+      const delay = got ? 2000 : Math.min(10 * 60_000, 4000 * 2 ** Math.min(mintFailStreak, 8));
+      mintBlockedUntil = got ? 0 : Date.now() + delay;
+      setTimeout(() => ensureTokens(), delay);
+    }
   });
-  if (!background) { /* caller may poll pool */ }
 }
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -666,9 +729,11 @@ async function resolveProxy(force = false) {
     }
   }
   log('connectivity: no working route (direct and proxies failed)');
-  resolvedProxy = null;
+  // Keep a previously working proxy instead of flapping: flipping the route on
+  // one failed probe used to respawn every CLI and kill in-flight requests.
+  if (resolvedProxy === undefined) resolvedProxy = null;
   resolvedProxyAt = Date.now();
-  return null;
+  return resolvedProxy;
 }
 
 // Env handed to the CLI child and to minting so their HTTP goes via the proxy.
@@ -947,39 +1012,71 @@ function resolveCliRoot() {
 }
 
 // -------------------------------------------------------- protocol client -----
+// One ZcodeClient == one zcode.cjs child process == ONE request slot.
+// The CLI runs generateText sequentially, so concurrency comes from running
+// several of these per account (see "worker pools" below) and giving every
+// request its own idle child — never from queueing several requests into the
+// same child (that is what made 4-6 sessions unusable, and a single timeout
+// then SIGKILLed the child and failed every request queued behind it).
 const rejectedModels = new Set();
+const QUOTA_RE = /exceed quota|\b1005\b|balance.*empty|insufficient.*quota/i;
+const CONC_RE = /concurren|rate.?limit|too many (?:requests|concurrent)|\b(?:1302|1303|1305|429)\b|overload/i;
+const TRANSIENT_RE = /timeout|timed out|unusual activity|captcha|CLI exited|CLI not running|CLI write failed|warming up|ECONNRESET|ECONNREFUSED|EPIPE|socket hang up|fetch failed|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|network|\b(?:502|503|504|529)\b|temporar|unavailable|internal server error/i;
+
+// loadAccountRevision parses desktop log files synchronously; with several
+// workers starting at once that would repeat the same work. Memoize briefly.
+let revisionMemo = { at: 0, file: null, value: null };
+function loadAccountRevisionCached(builtinFile) {
+  if (revisionMemo.value && revisionMemo.file === builtinFile && Date.now() - revisionMemo.at < 60_000) {
+    return revisionMemo.value;
+  }
+  const value = loadAccountRevision(builtinFile);
+  revisionMemo = { at: Date.now(), file: builtinFile, value };
+  return value;
+}
+
 class ZcodeClient {
-  constructor(account = null) {
-    this.account = account || activeAccount();
+  constructor(account, slot = 1) {
+    this.account = account;
+    this.slot = slot;
     this.child = null;
     this.ready = false;
+    this.busy = false;            // owned by the dispatcher: one request at a time
+    this.destroyed = false;
+    this.recycleWhenIdle = false;
     this.id = 0;
-    this.activeRequests = 0;
     this.pending = new Map();
     this.restartDelay = 1000;
+    this.restartTimer = null;
+    this.syncGen = 0;
+    this.lastUsed = Date.now();
+    this.waitReason = 'starting';
+    this.lastStderr = null;
+    this.inFlightModel = null;
+    // private cwd per worker so children never share workspace-level state
+    this.ws = path.join(workspace(account), 'w' + slot);
     this.start();
   }
 
+  get tag() { return `${this.account.name}#${this.slot}`; }
+
   start() {
+    if (this.destroyed) return;
+    this.restartTimer = null;
+    const retryLater = why => {
+      this.waitReason = why;
+      log(why);
+      this.restartTimer = setTimeout(() => this.start(), 10_000);
+    };
     const cli = resolveCliRoot();
     if (!cli) {
-      this.waitReason = 'zcode.cjs not found — install/open the ZCode desktop app once (needs ~/.zcode credentials), or set GLM_BRIDGE_CLI; retrying every 10s';
-      log(this.waitReason);
-      setTimeout(() => this.start(), 10_000);
-      return;
+      return retryLater('zcode.cjs not found — install/open the ZCode desktop app once (needs ~/.zcode credentials), or set GLM_BRIDGE_CLI; retrying every 10s');
     }
     const builtinFile = findBuiltinFile();
-    if (!builtinFile) {
-      this.waitReason = 'zcode-builtin.json not found next to the CLI; retrying every 10s';
-      log(this.waitReason);
-      setTimeout(() => this.start(), 10_000);
-      return;
-    }
-    this.waitReason = null;
-    const acc = this.account || activeAccount();
-    this.account = acc;
+    if (!builtinFile) return retryLater('zcode-builtin.json not found next to the CLI; retrying every 10s');
+
+    const acc = this.account;
     const accZcodeDir = path.join(acc.dir, '.zcode');
-    const ws = workspace(acc);
     const env = {
       ...process.env,
       ...proxyEnv(),
@@ -988,41 +1085,60 @@ class ZcodeClient {
       ZCODE_BUILTIN_PROVIDER_CONFIG_FILE: builtinFile,
       ZCODE_PERSONAL_PROVIDER_CONFIG_FILE: path.join(accZcodeDir, 'v2', 'provider_config.json'),
     };
-    try { fs.mkdirSync(ws, { recursive: true }); } catch { /* cwd below may exist */ }
-    log('spawning CLI:', cli, '| builtin:', builtinFile, '| account:', acc.name);
+    try { fs.mkdirSync(this.ws, { recursive: true }); } catch { /* cwd below may exist */ }
+    log(`spawning CLI [${this.tag}]:`, cli, '| builtin:', builtinFile);
     this.lastStderr = null;
     this.waitReason = 'spawning CLI';
-    this.child = spawn(process.execPath, [cli, 'app-server', '--stdio', '--surface', 'terminal'], {
-      cwd: ws, env, stdio: ['pipe', 'pipe', 'pipe'],
-    });
+    let child;
+    try {
+      child = spawn(process.execPath, [cli, 'app-server', '--stdio', '--surface', 'terminal'], {
+        cwd: this.ws, env, stdio: ['pipe', 'pipe', 'pipe'],
+      });
+    } catch (e) { return retryLater('spawn failed: ' + e.message); }
+    this.child = child;
     this.builtinFile = builtinFile;
     this.ready = false;
 
+    // An unhandled 'error' on stdin (EPIPE after the child died) would crash
+    // the whole bridge and take every session down with it.
+    child.stdin.on('error', () => { /* the exit handler cleans up */ });
+    child.on('error', e => log(`cli [${this.tag}] process error:`, e.message));
+    // setEncoding uses a StringDecoder: without it a multi-byte character
+    // (any non-ASCII text) split across two chunks gets corrupted.
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+
     let buf = '';
-    this.child.stdout.on('data', d => {
+    child.stdout.on('data', d => {
       buf += d;
       let i;
       while ((i = buf.indexOf('\n')) >= 0) {
         const line = buf.slice(0, i); buf = buf.slice(i + 1);
         if (!line.trim()) continue;
         let m; try { m = JSON.parse(line); } catch { log('cli stdout(non-json):', line.slice(0, 200)); continue; }
-        this.onMessage(m);
+        if (this.child === child) this.onMessage(m);
       }
     });
-    this.child.stderr.on('data', d => {
+    child.stderr.on('data', d => {
       for (const l of String(d).split('\n')) if (l.trim()) {
         this.lastStderr = l.slice(0, 300);
-        log('cli:', this.lastStderr);
+        log(`cli [${this.tag}]:`, this.lastStderr);
       }
     });
-    this.child.on('exit', code => {
-      this.waitReason = `CLI exited (code ${code}), restarting in ${this.restartDelay} ms${this.lastStderr ? ` — last stderr: ${this.lastStderr}` : ''}`;
-      log(this.waitReason);
+    child.on('exit', code => {
+      // A stale child (already replaced/destroyed) must never touch live state
+      // or schedule a second restart — that is how CLI processes used to leak.
+      if (this.child !== child) return;
+      this.child = null;
       this.ready = false;
       for (const [, p] of this.pending) p.resolve({ error: { message: 'CLI exited' } });
       this.pending.clear();
-      setTimeout(() => this.start(), this.restartDelay);
+      if (this.destroyed) return;
+      this.waitReason = `CLI exited (code ${code}), restarting in ${this.restartDelay} ms${this.lastStderr ? ` — last stderr: ${this.lastStderr}` : ''}`;
+      log(`[${this.tag}] ${this.waitReason}`);
+      this.restartTimer = setTimeout(() => this.start(), this.restartDelay);
       this.restartDelay = Math.min(this.restartDelay * 2, 30_000);
+      pumpSoon();
     });
 
     this.syncAccountConfig();
@@ -1056,7 +1172,8 @@ class ZcodeClient {
         // Only GLM-5.3 (premium) or explicit captcha-retry requests use tokens.
         // NEVER block an incoming request on Playwright (which takes 30-60s!)
         // If a token is in the pool, use it; if empty, refill in the background
-        // and proceed immediately.
+        // and proceed immediately. (inFlightModel is per worker, and a worker
+        // serves exactly one request at a time, so it cannot be clobbered.)
         const needsCaptcha = (this.inFlightModel === 'GLM-5.3') || reason === 'captcha-retry';
         let hdrs = {};
         if (needsCaptcha) {
@@ -1069,7 +1186,7 @@ class ZcodeClient {
         }
         const jwt = loadJwt(this.account);
         result = { headersApplied: true, requestAuth: { apiKey: jwt, headers: hdrs } };
-        log(`runtime headers applied (acc=${this.account ? this.account.name : 'default'}, reason=${reason}, model=${this.inFlightModel || '?'}, captcha=${Object.keys(hdrs).length ? 'token' : 'none'}, pool=${tokens.length})`);
+        log(`runtime headers applied (acc=${this.tag}, reason=${reason}, model=${this.inFlightModel || '?'}, captcha=${Object.keys(hdrs).length ? 'token' : 'none'}, pool=${tokens.length})`);
       } else {
         log('unhandled server request', m.method, JSON.stringify(m.params || {}).slice(0, 200));
         result = {};
@@ -1086,12 +1203,13 @@ class ZcodeClient {
 
   send(method, params, timeoutMs = 30_000, signal = null) {
     return new Promise(resolve => {
-      if (!this.child || !this.child.stdin.writable) {
+      const child = this.child;
+      if (!child || !child.stdin.writable) {
         resolve({ error: { message: 'CLI not running' } });
         return;
       }
       if (signal && signal.aborted) {
-        resolve({ error: { message: 'request aborted by client' } });
+        resolve({ error: { message: 'request aborted by client' }, aborted: true });
         return;
       }
       const id = 'req_' + (++this.id);
@@ -1109,173 +1227,194 @@ class ZcodeClient {
         }
       });
       timer = setTimeout(() => {
-        if (this.pending.has(id)) {
-          this.pending.delete(id);
-          cleanup();
-          const elapsed = Date.now() - tStart;
-          log(`[send TIMEOUT acc=${this.account ? this.account.name : '?'}] ${id} ${method} elapsed=${elapsed}ms timeoutMs=${timeoutMs}`);
-          try {
-            if (this.child) {
-              log(`killing hung child CLI for "${this.account ? this.account.name : '?'}" (PID ${this.child.pid})`);
-              this.ready = false;
-              this.child.kill('SIGKILL');
-            }
-          } catch {}
-          resolve({ error: { message: `timeout waiting for ${method}` } });
-        }
+        if (!this.pending.has(id)) return;
+        this.pending.delete(id);
+        cleanup();
+        log(`[send TIMEOUT ${this.tag}] ${id} ${method} elapsed=${Date.now() - tStart}ms timeoutMs=${timeoutMs}`);
+        // This worker only ever carries this one request, so killing the hung
+        // child no longer takes any other session's request down with it.
+        if (this.child === child) this.ready = false;
+        try { child.kill('SIGKILL'); } catch { /* already gone */ }
+        resolve({ error: { message: `timeout waiting for ${method}` }, timedOut: true });
       }, timeoutMs);
       if (signal) {
         onAbort = () => {
           if (this.pending.has(id)) {
             this.pending.delete(id);
             cleanup();
-            resolve({ error: { message: 'request aborted by client' } });
+            resolve({ error: { message: 'request aborted by client' }, aborted: true });
           }
         };
         signal.addEventListener('abort', onAbort, { once: true });
       }
-      this.child.stdin.write(JSON.stringify({ id, method, params }) + '\n');
+      try {
+        child.stdin.write(JSON.stringify({ id, method, params }) + '\n');
+      } catch (e) {
+        this.pending.delete(id);
+        cleanup();
+        resolve({ error: { message: 'CLI write failed: ' + e.message } });
+      }
     });
   }
 
+  // Push the account config into a freshly started child. Retries until it
+  // lands (a worker that never becomes ready would otherwise stall the pool),
+  // and restarts the child if it never does.
   async syncAccountConfig() {
-    // wait for the runtime to come up, then push account config (retry a few times)
-    for (let i = 0; i < 20 && !this.ready; i++) {
-      await new Promise(r => setTimeout(r, 500));
-      if (!this.child || this.child.exitCode !== null) return;
-      // probe: storage handshake happens first; try sync every 2s
-      if (i % 4 !== 3) continue;
+    const gen = ++this.syncGen;
+    const child = this.child;
+    for (let i = 0; i < 45; i++) {
+      await sleep(2000);
+      if (this.destroyed || this.syncGen !== gen || this.child !== child || !child || child.exitCode !== null) return;
       let acct;
-      try { acct = loadAccountRevision(this.builtinFile); } catch (e) { log('revision error:', e.message); continue; }
+      try { acct = loadAccountRevisionCached(this.builtinFile); } catch (e) { log('revision error:', e.message); continue; }
       const r = await this.send('provider/updateAccountConfig', {
         revision: acct.revision,
         basedOnZCodeBuiltinRevision: acct.basedOnZCodeBuiltinRevision,
         providers: acct.providers,
         states: acct.states,
-      }, 10_000);
+      }, 15_000);
+      if (this.destroyed || this.syncGen !== gen) return;
       if (r.result && r.result.status) {
         this.ready = true;
         this.restartDelay = 1000;
-        log(`account config synced (${r.result.status}, providers=${r.result.providerCount})`);
+        this.waitReason = null;
+        log(`account config synced [${this.tag}] (${r.result.status}, providers=${r.result.providerCount})`);
+        pumpSoon();
         return;
       }
-      log('updateAccountConfig attempt failed:', JSON.stringify(r.error || r).slice(0, 300));
+      if (i % 5 === 4) log(`updateAccountConfig attempt failed [${this.tag}]:`, JSON.stringify(r.error || r).slice(0, 300));
     }
-    log('WARN: account config not synced after retries');
+    if (!this.destroyed && this.syncGen === gen) {
+      log(`WARN: [${this.tag}] account config not synced after ~90s, restarting CLI`);
+      this.restartNow('config sync failed');
+    }
   }
 
-  // Serialize upstream calls: Aliyun captcha can reject duplicate concurrent submits.
-  generate({ systemBlocks, messages, tools, maxOutputTokens, reasoningLevel, modelId, signal }) {
-    this.activeRequests = (this.activeRequests || 0) + 1;
-    const run = async () => {
-      try {
-        if (!this.ready) {
-          // one nudge in case sync is lagging
-          await this.syncAccountConfig();
-          if (!this.ready) return { error: { message: 'bridge warming up, retry shortly' } };
-        }
-        if (signal && signal.aborted) return { error: { message: 'request aborted by client' } };
-      // Known-rejected models (registry lacks them) go straight to Flash —
-      // otherwise every glm-5.3 request paid a ~10s upstream rejection first.
-      const requestedModel = modelId || 'GLM-5.3-Flash';
-      const effectiveModel = (rejectedModels.has(requestedModel))
-        ? 'GLM-5.3-Flash' : requestedModel;
-      // Premium model billing: the upstream silently downgrades captcha-less
-      // GLM-5.3 requests to GLM-5.3-Flash (verified by bucket deltas). Flag
-      // the client so its runtime-headers responder attaches a token.
-      this.inFlightModel = effectiveModel;
-      const opId = 'op-' + crypto.randomUUID();
-      const params = {
-        operationId: opId,
-        workspace: { workspacePath: workspace(this.account), workspaceKey: workspace(this.account) },
-        selection: {
-          providerId: 'account:zai-start-plan',
-          modelId: effectiveModel,
-          options: { reasoningLevel: reasoningLevel || 'low' },
-        },
-        messages: [...systemBlocks, ...messages],
-        querySource: 'bridge',
-        maxOutputTokens,
+  restartNow(why = 'restart') {
+    const child = this.child;
+    this.ready = false;
+    if (!child) return;
+    log(`restarting CLI [${this.tag}] (${why})`);
+    try { child.kill('SIGTERM'); } catch { /* gone */ }
+    const t = setTimeout(() => {
+      if (child.exitCode === null && child.signalCode === null) { try { child.kill('SIGKILL'); } catch { /* gone */ } }
+    }, 3000);
+    if (t.unref) t.unref();
+  }
+
+  destroy() {
+    this.destroyed = true;
+    this.ready = false;
+    if (this.restartTimer) { clearTimeout(this.restartTimer); this.restartTimer = null; }
+    for (const [, p] of this.pending) p.resolve({ error: { message: 'CLI exited' } });
+    this.pending.clear();
+    const child = this.child;
+    this.child = null;
+    if (child) {
+      try { child.kill('SIGTERM'); } catch { /* gone */ }
+      const t = setTimeout(() => {
+        if (child.exitCode === null && child.signalCode === null) { try { child.kill('SIGKILL'); } catch { /* gone */ } }
+      }, 3000);
+      if (t.unref) t.unref();
+    }
+  }
+
+  // Runs exactly one upstream generation. The dispatcher guarantees this
+  // worker is not used by anything else until the returned promise settles.
+  async generate({ systemBlocks, messages, tools, maxOutputTokens, reasoningLevel, modelId, signal }) {
+    const aborted = () => ({ error: { message: 'request aborted by client' }, aborted: true });
+    if (!this.ready || !this.child) return { error: { message: 'bridge warming up, retry shortly' }, isTransient: true };
+    if (signal && signal.aborted) return aborted();
+
+    const accName = this.account.name;
+    // Known-rejected models (registry lacks them) go straight to Flash —
+    // otherwise every glm-5.3 request paid a ~10s upstream rejection first.
+    const requestedModel = modelId || 'GLM-5.3-Flash';
+    const effectiveModel = rejectedModels.has(requestedModel) ? 'GLM-5.3-Flash' : requestedModel;
+    // Premium model billing: the upstream silently downgrades captcha-less
+    // GLM-5.3 requests to GLM-5.3-Flash (verified by bucket deltas). Flag
+    // the client so its runtime-headers responder attaches a token.
+    this.inFlightModel = effectiveModel;
+    const params = {
+      operationId: 'op-' + crypto.randomUUID(),
+      workspace: { workspacePath: this.ws, workspaceKey: this.ws },
+      selection: {
+        providerId: 'account:zai-start-plan',
+        modelId: effectiveModel,
+        options: { reasoningLevel: reasoningLevel || 'low' },
+      },
+      messages: [...systemBlocks, ...messages],
+      querySource: 'bridge',
+      maxOutputTokens,
+    };
+    if (tools && tools.length) params.tools = tools;
+
+    let cancelAck = null;
+    let onAbort = null;
+    if (signal) {
+      onAbort = () => {
+        // Tell the CLI to stop (saves quota too) and remember to wait for the
+        // ack in `finally`, so the next request is never handed a worker that
+        // is still busy unwinding this one.
+        try {
+          const id = 'req_' + (++this.id);
+          cancelAck = new Promise(res => this.pending.set(id, { resolve: res }));
+          this.child.stdin.write(JSON.stringify({ id, method: 'workspace/cancelGenerateText', params: { operationId: params.operationId } }) + '\n');
+        } catch { /* child gone; nothing to cancel */ }
       };
-      if (tools && tools.length) params.tools = tools;
-      let onAbort = null;
-      if (signal) {
-        onAbort = () => {
-          // Fire-and-forget: the child may be busy streaming a huge prompt, so
-          // the cancel ack can legitimately take longer than any timeout here.
-          // Killing the CLI over a slow cancel would destroy an in-flight
-          // generation for other waiters — just deliver the cancel best-effort.
-          try {
-            const id = 'req_' + (++this.id);
-            this.child?.stdin?.write(JSON.stringify({ id, method: 'workspace/cancelGenerateText', params: { operationId: opId } }) + '\n');
-          } catch { /* child gone; nothing to cancel */ }
-        };
-        signal.addEventListener('abort', onAbort, { once: true });
-      }
-      const sendTimeoutMs = Number(process.env.GLM_BRIDGE_TIMEOUT_MS) || 300_000;
-      const sendOnce = () => this.send('workspace/generateText', params, sendTimeoutMs, signal);
-      let r;
-      try {
-        r = await sendOnce();
-      } finally {
-        if (signal && onAbort) signal.removeEventListener('abort', onAbort);
-      }
-      if (signal && signal.aborted) return { error: { message: 'request aborted by client' } };
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
+    const sendTimeoutMs = Number(process.env.GLM_BRIDGE_TIMEOUT_MS) || 300_000;
+    const sendOnce = () => this.send('workspace/generateText', params, sendTimeoutMs, signal);
+
+    try {
+      let r = await sendOnce();
+      if (signal && signal.aborted) return aborted();
+
       // If the upstream starts demanding captcha tokens again, recover on the
       // spot instead of failing the request: flip the policy and retry once.
       if (r.error && /3012|unusual activity|captcha/i.test(JSON.stringify(r.error))) {
         forceCaptchaRequired('upstream rejected the request');
         await sleep(400);
         r = await sendOnce();
+        if (signal && signal.aborted) return aborted();
       }
+
       // The cached account revision may not list a newly added model (e.g.
-      // GLM-5.3 joined the plan after the desktop last wrote its log). If the
-      // upstream rejects the model as unknown/unentitled, retry once on the
-      // plan's baseline Flash and remember what worked.
-      //
-      // IMPORTANT: quota exhaustion ("exceed quota limit") is PER-ACCOUNT —
-      // it must NOT blacklist GLM-5.3 globally, or one drained 3M bucket
-      // silently switches every other account (with full 3M buckets) to
-      // Flash too. Only a genuine registry/entitlement error marks the model
-      // rejected; quota errors fall back for THIS request only.
-      const accName = this.account ? this.account.name : 'default';
-      if (r.error && params.selection.modelId !== 'GLM-5.3-Flash') {
+      // GLM-5.3 joined the plan after the desktop last wrote its log). Only a
+      // genuine registry/entitlement error marks the model rejected and falls
+      // back to Flash. Quota and transient errors propagate so the dispatcher
+      // can retry on another account/worker — never silently bill Flash.
+      if (r.error && params.selection.modelId === 'GLM-5.3') {
         const errText = JSON.stringify(r.error);
-        const isQuotaErr = /exceed quota|1005|balance.*empty|insufficient.*quota/i.test(errText);
-        // Concurrency/rate limits are TRANSIENT: never a registry rejection.
+        const isQuotaErr = QUOTA_RE.test(errText);
         const isTransient = /concurrency|rate limit|too many|timeout|timed out/i.test(errText);
-        // Registry rejection = the model id itself is unknown/unentitled.
         // NOTE: "model" appears in every AiSdk error string, so it must not
         // be part of the match.
         const isRegistryErr = !isQuotaErr && !isTransient
           && /entitle|not_found|notfound|not\s*(?:supported|available|registered)|unknown model|invalid model|not_entitled/i.test(errText);
-        if (params.selection.modelId === 'GLM-5.3' && (isQuotaErr || isRegistryErr)) {
-          if (isRegistryErr && !rejectedModels.has('GLM-5.3')) {
+        if (isQuotaErr) {
+          log(`account "${accName}" GLM-5.3 quota exhausted`);
+          return { error: r.error, isQuotaExhausted: true };
+        }
+        if (isRegistryErr) {
+          if (!rejectedModels.has('GLM-5.3')) {
             log(`model GLM-5.3 registry-rejected (${errText.slice(0, 160)}), blacklisting globally`);
             rejectedModels.add('GLM-5.3');
-          } else if (isQuotaErr) {
-            log(`account "${accName}" GLM-5.3 quota exhausted, using Flash for this request`);
-          } else {
-            log(`model ${params.selection.modelId} rejected (${errText.slice(0, 160)}), falling back to GLM-5.3-Flash`);
-          }
-          // Never silently degrade GLM-5.3 -> Flash: that bills the Flash
-          // bucket and defeats the whole point of separate pools. Transient
-          // and quota errors propagate so generateWithFailover can retry on
-          // another account (or the caller can retry); only a registry
-          // rejection is permanent and falls back here.
-          if (!isRegistryErr) {
-            return { error: r.error, isQuotaExhausted: isQuotaErr, isTransient: !isQuotaErr };
           }
           params.selection.modelId = 'GLM-5.3-Flash';
           r = await sendOnce();
+          if (signal && signal.aborted) return aborted();
         }
       }
+
       if (r.error) {
         const msg = JSON.stringify(r.error);
-        log('generateText error (req=' + requestedModel + ' eff=' + effectiveModel + ' acc=' + (this.account ? this.account.name : 'default') + '):', msg.slice(0, 3000));
-        const isQuota = /exceed quota|1005|balance.*empty|insufficient.*quota/i.test(msg);
-        return { error: r.error, isQuotaExhausted: isQuota };
+        log(`generateText error (req=${requestedModel} eff=${effectiveModel} acc=${this.tag}):`, msg.slice(0, 800));
+        return { error: r.error, isQuotaExhausted: QUOTA_RE.test(msg), timedOut: !!r.timedOut };
       }
+
       let result = r.result;
       // Thinking can swallow a small output budget: retry once with a bigger cap.
       const empty = result && !result.text && !(result.toolCalls && result.toolCalls.length)
@@ -1284,25 +1423,23 @@ class ZcodeClient {
         log('empty length-truncated response, retrying with maxOutputTokens=8192');
         params.maxOutputTokens = 8192;
         params.operationId = 'op-' + crypto.randomUUID();
-        const sendTimeoutMs = Number(process.env.GLM_BRIDGE_TIMEOUT_MS) || 300_000;
         const r2 = await this.send('workspace/generateText', params, sendTimeoutMs, signal);
+        if (signal && signal.aborted) return aborted();
         if (r2.result) result = r2.result;
-        else if (r2.error) return { error: r2.error };
+        else if (r2.error) return { error: r2.error, timedOut: !!r2.timedOut };
       }
-      // A successful completion proves quota is back: drop the rotation park
-      // so this account can be selected again (checked lazily, one read).
       quotaState.lastOkAt = Date.now();
-      try {
-        const a = loadAccounts();
-        const cur = a.accounts.find(x => x.name === a.active);
-        if (cur && cur.exhaustedUntil) { delete cur.exhaustedUntil; saveAccounts(a); }
-      } catch { /* non-fatal */ }
-        return { result };
-      } finally {
-        this.activeRequests = Math.max(0, (this.activeRequests || 1) - 1);
+      return { result };
+    } finally {
+      if (signal && onAbort) signal.removeEventListener('abort', onAbort);
+      if (cancelAck) {
+        const acked = await Promise.race([cancelAck.then(() => true), sleep(4000).then(() => false)]);
+        if (!acked) {
+          log(`cancel not acknowledged within 4s [${this.tag}], recycling CLI`);
+          this.restartNow('stuck after cancel');
+        }
       }
-    };
-    return run();
+    }
   }
 }
 
@@ -1425,253 +1562,329 @@ function parseJsonSafe(s) {
 }
 
 // ------------------------------------------------------------- HTTP layer ----
-// Lazy: control commands (status/stop/logs) must not boot the whole runtime.
-const clientPool = new Map();
+// ------------------------------------------------------------ worker pools ---
+// How concurrency works now
+//   * One zcode.cjs child serves ONE request at a time. Each account gets a
+//     pool of up to GLM_BRIDGE_WORKERS children (default 4, grown on demand,
+//     2 kept warm, idle extras reaped after 15 min).
+//   * A request is handed an idle child; if none is free it waits in an
+//     in-process queue (instant wake-up, abortable, no polling). Requests
+//     without tools (title/summary side-calls) go ahead of the long agent
+//     turns, with aging so nothing starves.
+//   * Z.ai limits concurrent requests per user. When it pushes back, the
+//     account's concurrency limit is halved and creeps back up after a streak
+//     of successes, and the request is retried with backoff — the client
+//     never sees the transient error.
+//   Routing "fill-first" prefers the active account until it is saturated;
+//   "round-robin" and "session-pin" both balance by load (pinning a session
+//   to a child is pointless now that every request gets its own child).
+const WORKERS_MAX = Math.max(1, Number(process.env.GLM_BRIDGE_WORKERS) || 4);
+const WORKERS_WARM = Math.min(WORKERS_MAX, Math.max(1, Number(process.env.GLM_BRIDGE_WARM) || 2));
+const WORKER_IDLE_MS = (Number(process.env.GLM_BRIDGE_IDLE_MIN) || 15) * 60_000;
+const QUEUE_TIMEOUT_MS = Number(process.env.GLM_BRIDGE_QUEUE_TIMEOUT_MS) || 240_000;
+const MAX_RETRIES = Number(process.env.GLM_BRIDGE_RETRIES) || 8;
+const TOTAL_BUDGET_MS = Number(process.env.GLM_BRIDGE_BUDGET_MS) || 6 * 60_000;
+const LIGHT_BONUS_MS = 10_000;
 
-// ------------------------------------------------------ session pinning ----
-// Pin each client TCP connection (source port) to one account so concurrent
-// sessions never share a CLI slot. zcode.cjs processes messages sequentially
-// per CLI, so two sessions on one CLI block each other for the whole
-// generateText duration.
-const sessionPins = new Map();          // remotePort -> { name, at }
-const SESSION_PIN_TTL_MS = 30 * 60_000; // reclaim idle pins after 30 min
+const accountPools = new Map();   // account name -> { name, workers[], limit, okStreak, lastShrinkAt }
+const waiters = [];               // requests waiting for a free worker
+let rrCounter = 0;
 
-function pinnedAccountFor(remotePort) {
-  const pin = sessionPins.get(remotePort);
-  if (pin && Date.now() - pin.at < SESSION_PIN_TTL_MS) {
-    pin.at = Date.now();
-    return pin.name;
+function getPool(name) {
+  let p = accountPools.get(name);
+  if (!p) {
+    p = { name, workers: [], limit: WORKERS_MAX, okStreak: 0, lastShrinkAt: 0 };
+    accountPools.set(name, p);
   }
-  return null;
+  return p;
+}
+const poolBusy = p => p.workers.filter(w => w.busy && !w.destroyed).length;
+function poolStats(name) {
+  const p = accountPools.get(name);
+  const ws = p ? p.workers.filter(w => !w.destroyed) : [];
+  return {
+    workers: ws.length,
+    ready: ws.filter(w => w.ready).length,
+    busy: ws.filter(w => w.busy).length,
+    limit: p ? p.limit : WORKERS_MAX,
+  };
 }
 
-function pinSession(remotePort, accountName) {
-  // evict stale pins so the map cannot grow unbounded
+function spawnWorker(pool, acc) {
+  const used = new Set(pool.workers.map(w => w.slot));
+  let slot = 1;
+  while (used.has(slot)) slot++;
+  const w = new ZcodeClient(acc, slot);
+  pool.workers.push(w);
+  return w;
+}
+
+// AIMD on the per-account concurrency limit.
+function poolOnSuccess(name) {
+  const p = getPool(name);
+  p.okStreak++;
+  if (p.limit < WORKERS_MAX && p.okStreak >= 15 && Date.now() - p.lastShrinkAt > 30_000) {
+    p.limit++;
+    p.okStreak = 0;
+    log(`account "${name}" concurrency limit raised to ${p.limit}`);
+    pumpSoon();
+  }
+}
+function poolOnConcurrencyError(name) {
+  const p = getPool(name);
+  p.okStreak = 0;
   const now = Date.now();
-  for (const [k, v] of sessionPins) if (now - v.at > SESSION_PIN_TTL_MS) sessionPins.delete(k);
-  sessionPins.set(remotePort, { name: accountName, at: now });
-}
-
-function pinBusy(accountName) {
-  const c = clientPool.get(accountName);
-  return !c || !c.ready || (c.activeRequests || 0) > 0;
-}
-
-// Returns an account name for this session, or null to use the standard picker.
-function accountForSession(remotePort, requestedModel) {
-  // 1. Already pinned -> reuse it if the CLI is free.
-  const pinned = pinnedAccountFor(remotePort);
-  if (pinned && !pinBusy(pinned)) return pinned;
-  // 2. Pin to the idle account carrying the fewest sessions.
-  const usable = getUsableAccounts().filter(a => {
-    const c = clientPool.get(a.name);
-    return c && c.ready && (c.activeRequests || 0) === 0;
-  });
-  const candidates = usable.filter(a => accountHasModelTokens(a.name, requestedModel));
-  const pool = candidates.length ? candidates : usable;
-  if (pool.length) {
-    const pinLoad = name => [...sessionPins.values()].filter(p => p.name === name).length;
-    const picked = pool.reduce((best, a) => (pinLoad(a.name) < pinLoad(best.name) ? a : best));
-    pinSession(remotePort, picked.name);
-    return picked.name;
+  if (now - p.lastShrinkAt < 2000) return;       // one backoff per burst of errors
+  p.lastShrinkAt = now;
+  const next = Math.max(1, Math.floor(p.limit / 2));
+  if (next !== p.limit) {
+    log(`account "${name}" hit upstream concurrency limit, lowering concurrency ${p.limit} -> ${next}`);
+    p.limit = next;
   }
-  // 3. Nothing idle: fall back to the standard picker (wait-for-slot logic).
+}
+
+function candidateAccounts(w8) {
+  const now = Date.now();
+  const all = loadAccounts().accounts
+    .filter(a => !w8.tried.has(a.name) && fs.existsSync(accountCredFile(a)));
+  const usable = all.filter(a => !(a.exhaustedUntil && a.exhaustedUntil > now)
+    && !(a.quotaEmptyUntil && a.quotaEmptyUntil > now));
+  const withModel = usable.filter(a => accountHasModelTokens(a.name, w8.model));
+  if (withModel.length) return withModel;
+  if (usable.length) return usable;
+  return all;   // everything parked: still try, the parked state may be stale
+}
+
+function orderAccounts(accs, routing) {
+  const active = loadAccounts().active;
+  const rr = rrCounter++;
+  const n = accs.length;
+  return accs
+    .map((a, i) => {
+      const p = getPool(a.name);
+      const busy = poolBusy(p);
+      const saturated = busy >= p.limit;
+      const preferred = routing === 'fill-first' && a.name === active && !saturated ? 0 : 1;
+      return { a, preferred, load: busy / Math.max(1, p.limit), tie: (i + rr) % n };
+    })
+    .sort((x, y) => x.preferred - y.preferred || x.load - y.load || x.tie - y.tie)
+    .map(x => x.a);
+}
+
+// Returns a ready idle worker, null (keep waiting, possibly after growing a
+// pool), or 'none' when no account can serve this request at all.
+function tryAssign(w8) {
+  const accs = candidateAccounts(w8);
+  if (!accs.length) return 'none';
+  const ordered = orderAccounts(accs, getRoutingMode());
+  for (const a of ordered) {
+    const pool = getPool(a.name);
+    if (poolBusy(pool) >= pool.limit) continue;
+    const idle = pool.workers.find(w => w.ready && !w.busy && !w.destroyed);
+    if (idle) return idle;
+  }
+  // Nothing idle: start one more child (one at a time per account, which also
+  // staggers the CPU spike of booting several Node processes).
+  for (const a of ordered) {
+    const pool = getPool(a.name);
+    const live = pool.workers.filter(w => !w.destroyed);
+    if (live.length < pool.limit && !live.some(w => !w.ready)) {
+      spawnWorker(pool, a);
+      break;
+    }
+  }
   return null;
 }
-function getClientForAccount(acc) {
-  if (!acc) acc = activeAccount();
-  let c = clientPool.get(acc.name);
-  if (!c || !c.child || c.child.exitCode !== null) {
-    c = new ZcodeClient(acc);
-    clientPool.set(acc.name, c);
+
+function pump() {
+  if (!waiters.length) return;
+  waiters.sort((a, b) =>
+    (a.enq - (a.light ? LIGHT_BONUS_MS : 0)) - (b.enq - (b.light ? LIGHT_BONUS_MS : 0)));
+  for (let i = 0; i < waiters.length;) {
+    const w8 = waiters[i];
+    const r = tryAssign(w8);
+    if (r === 'none') { waiters.splice(i, 1); w8.finish({ reason: 'no-account' }); continue; }
+    if (r) { waiters.splice(i, 1); r.busy = true; w8.finish({ worker: r }); continue; }
+    i++;
   }
-  return c;
 }
-function getClient() {
-  return getClientForAccount(activeAccount());
+let pumpScheduled = false;
+function pumpSoon() {
+  if (pumpScheduled) return;
+  pumpScheduled = true;
+  setImmediate(() => { pumpScheduled = false; pump(); });
 }
 
-let roundRobinIdx = 0;
-function getNextClient(excludeNames = new Set(), requestedModel = null) {
-  const routing = getRoutingMode();
-  const allUsable = getUsableAccounts();
-  const usable = allUsable.filter(a => {
-    if (excludeNames.has(a.name)) return false;
-    if (requestedModel && !accountHasModelTokens(a.name, requestedModel)) return false;
-    const c = clientPool.get(a.name);
-    if (c && !c.ready) return false;
-    return true;
+function acquireWorker({ signal, model, tried, light }) {
+  return new Promise(resolve => {
+    if (signal && signal.aborted) return resolve({ reason: 'aborted' });
+    const w8 = { enq: Date.now(), light: !!light, tried, model, timer: null, onAbort: null };
+    const remove = () => { const i = waiters.indexOf(w8); if (i >= 0) waiters.splice(i, 1); };
+    w8.finish = v => {
+      clearTimeout(w8.timer);
+      if (signal && w8.onAbort) signal.removeEventListener('abort', w8.onAbort);
+      resolve(v);
+    };
+    w8.timer = setTimeout(() => { remove(); w8.finish({ reason: 'timeout' }); }, QUEUE_TIMEOUT_MS);
+    if (signal) {
+      w8.onAbort = () => { remove(); w8.finish({ reason: 'aborted' }); };
+      signal.addEventListener('abort', w8.onAbort, { once: true });
+    }
+    waiters.push(w8);
+    pump();
   });
-  const finalUsable = usable.length ? usable : allUsable.filter(a => !excludeNames.has(a.name));
-  if (!usable.length) {
-    // If all usable accounts are excluded or none usable, try any logged-in account not excluded
-    const all = loadAccounts().accounts.filter(a => fs.existsSync(accountCredFile(a)));
-    const remaining = all.filter(a => !excludeNames.has(a.name));
-    const fallback = remaining.length ? remaining[0] : (all[0] || activeAccount());
-    return getClientForAccount(fallback);
-  }
+}
 
-  if (routing === 'fill-first') {
-    const active = activeAccount();
-    const actUsable = finalUsable.find(x => x.name === active.name);
-    return getClientForAccount(actUsable || finalUsable[0]);
-  }
+function releaseWorker(w) {
+  w.busy = false;
+  w.lastUsed = Date.now();
+  if (w.recycleWhenIdle) { w.recycleWhenIdle = false; w.restartNow('recycle'); }
+  pumpSoon();
+}
 
-  // Least-busy load balancing across usable accounts:
-  // Routes traffic away from accounts currently processing heavy multi-turn prompts
-  // (e.g. Claude Code 150k contexts) to completely idle accounts.
-  let best = finalUsable[0];
-  let minActive = Infinity;
-  for (let i = 0; i < finalUsable.length; i++) {
-    const idx = (roundRobinIdx + i) % finalUsable.length;
-    const acc = finalUsable[idx];
-    const c = clientPool.get(acc.name);
-    const active = c ? (c.activeRequests || 0) : 0;
-    if (active < minActive) {
-      minActive = active;
-      best = acc;
-      if (active === 0) {
-        roundRobinIdx = (idx + 1) % finalUsable.length;
-        break; // Found an idle account, dispatch immediately!
+function warmPools() {
+  for (const acc of getUsableAccounts()) {
+    const pool = getPool(acc.name);
+    const have = pool.workers.filter(w => !w.destroyed).length;
+    for (let i = 0; i < WORKERS_WARM - have; i++) {
+      setTimeout(() => {
+        if (pool.workers.filter(w => !w.destroyed).length < WORKERS_WARM) spawnWorker(pool, acc);
+      }, 500 * i);
+    }
+  }
+}
+
+function reapIdleWorkers() {
+  const now = Date.now();
+  for (const pool of accountPools.values()) {
+    pool.workers = pool.workers.filter(w => !w.destroyed);
+    for (const w of [...pool.workers]) {
+      if (pool.workers.length <= WORKERS_WARM) break;
+      if (!w.busy && w.ready && now - w.lastUsed > WORKER_IDLE_MS) {
+        log(`reaping idle worker [${w.tag}]`);
+        w.destroy();
+        pool.workers = pool.workers.filter(x => x !== w);
       }
     }
   }
-  return getClientForAccount(best);
 }
 
-function warmClientPool() {
-  const usable = getUsableAccounts();
-  for (const acc of usable) {
-    getClientForAccount(acc);
+function shutdownPools() {
+  for (const pool of accountPools.values()) for (const w of pool.workers) w.destroy();
+}
+
+// Restart children (e.g. after the proxy route changed) without killing
+// anything in flight: idle ones now, busy ones as soon as they are released.
+function recyclePools() {
+  for (const pool of accountPools.values()) {
+    for (const w of pool.workers) {
+      if (w.destroyed) continue;
+      if (w.busy) w.recycleWhenIdle = true; else w.restartNow('connectivity change');
+    }
   }
 }
 
-function shutdownClientPool() {
-  for (const [, c] of clientPool) {
-    try { if (c.child) c.child.kill('SIGTERM'); } catch {}
-  }
+const sleepAbortable = (ms, signal) => new Promise(resolve => {
+  let t = null;
+  const done = () => { clearTimeout(t); if (signal) signal.removeEventListener('abort', done); resolve(); };
+  t = setTimeout(done, ms);
+  if (signal) signal.addEventListener('abort', done, { once: true });
+});
+const backoffMs = n => Math.round(Math.min(6000, 500 * Math.pow(1.8, n - 1)) * (0.75 + Math.random() * 0.5));
+
+function classifyError(out) {
+  if (out.aborted) return 'aborted';
+  const err = out.error;
+  const txt = typeof err === 'string' ? err : JSON.stringify(err || {});
+  if (out.isQuotaExhausted || QUOTA_RE.test(txt)) return 'quota';
+  if (CONC_RE.test(txt)) return 'concurrency';
+  if (out.isTransient || out.timedOut || TRANSIENT_RE.test(txt)) return 'transient';
+  return 'fatal';
 }
 
-function respawnClientPool() {
-  for (const [, c] of clientPool) {
-    try { if (c.child) c.child.kill('SIGHUP'); } catch {}
-  }
-}
+const ABORTED = () => ({ error: { message: 'request aborted by client' }, aborted: true });
 
 async function generateWithFailover(options) {
   const requestedModel = options.modelId || 'GLM-5.3-Flash';
-  const routing = getRoutingMode();
-  const reqRemotePort = options.sessionPort || null;
-  const triedAccounts = new Set();
-  const allAccounts = loadAccounts().accounts.filter(a => fs.existsSync(accountCredFile(a)));
-  const maxAttempts = Math.max(1, allAccounts.length);
+  const light = !(options.tools && options.tools.length);
+  const tried = new Set();          // accounts that are out of quota for THIS request
+  const started = Date.now();
   let lastOut = null;
-  // Wait for an idle CLI slot before dispatching.  When all accounts are
-  // busy, queuing inside zcode.cjs blocks the whole process (sequential
-  // message queue).  Instead, poll briefly for a free slot.
-  const waitForSlot = async (signal) => {
-    for (let i = 0; i < 150; i++) {  // up to ~150s
-      if (signal && signal.aborted) return;
-      for (const [, c] of clientPool) {
-        if (c.ready && (c.activeRequests || 0) === 0) return;
+  let retries = 0;
+  let timeoutRetries = 0;
+
+  for (;;) {
+    if (options.signal && options.signal.aborted) return ABORTED();
+
+    const got = await acquireWorker({ signal: options.signal, model: requestedModel, tried, light });
+    if (!got.worker) {
+      if (got.reason === 'aborted') return ABORTED();
+      if (got.reason === 'timeout') {
+        return { error: { message: 'bridge is saturated: no free worker slot, retry shortly' }, isTransient: true };
       }
-      await new Promise(r => setTimeout(r, 1000));
-    }
-  };
-
-  for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    if (options.signal && options.signal.aborted) {
-      log('request already aborted by client, skipping failover');
-      return lastOut || { error: { message: 'request aborted by client' } };
-    }
-    // If all CLIs are busy, wait for one to free up rather than queuing
-    // inside zcode.cjs where it blocks the sequential message pump.
-    const allBusy = [...clientPool.values()].every(c => !c.ready || (c.activeRequests || 0) > 0);
-    if (allBusy && attempt === 0) {
-      log('all CLI slots busy, waiting for idle slot...');
-      await waitForSlot(options.signal);
-      if (options.signal && options.signal.aborted) {
-        return { error: { message: 'request aborted by client' } };
-      }
-    }
-    const c = (routing === 'session-pin' && reqRemotePort)
-      ? (() => {
-          const pinnedName = accountForSession(reqRemotePort, requestedModel);
-          if (pinnedName) {
-            const acc = allAccounts.find(a => a.name === pinnedName) || { name: pinnedName };
-            triedAccounts.add(pinnedName);
-            log(`dispatching request to pinned account "${pinnedName}" (session ${reqRemotePort})`);
-            return getClientForAccount(acc);
-          }
-          return getNextClient(triedAccounts, requestedModel);
-        })()
-      : getNextClient(triedAccounts, requestedModel);
-    if (!c) break;
-    const accName = (c && c.account) ? c.account.name : activeAccount().name;
-    triedAccounts.add(accName);
-    log(`dispatching request to account "${accName}" (mode: ${getRoutingMode()})`);
-    let out = await c.generate(options);
-    if (options.signal && options.signal.aborted) {
-      log(`request aborted by client (acc=${accName}), stopping failover`);
-      return out;
-    }
-    // Per-model empty: if this account drained the bucket covering the
-    // requested model but OTHER accounts still have tokens for it, retry
-    // there instead of failing over the whole request.
-    if (out.error && !out.isQuotaExhausted) {
-      const errText = JSON.stringify(out.error);
-      const isModelQuota = /exceed quota|1005|insufficient.*quota|balance.*empty/i.test(errText);
-      const modelInFlight = options.modelId || requestedModel;
-      if (isModelQuota && !accountHasModelTokens(accName, modelInFlight)) {
-        log(`account "${accName}" has no ${modelInFlight} tokens left, trying another account`);
-        continue;
-      }
-    }
-
-    if (!out.error) {
-      clearAccountExhaustion(accName);
-      return out;
-    }
-
-    lastOut = out;
-    const isExhausted = out.isQuotaExhausted || /exceed quota|1005|balance.*empty|insufficient.*quota/i.test(JSON.stringify(out.error));
-
-    if (isExhausted) {
-      log(`account "${accName}" quota exhausted, marking paused`);
-      markAccountExhausted(accName, '1005 quota exhausted');
-
-      const remainingUsable = getUsableAccounts().filter(a =>
-        !triedAccounts.has(a.name) && accountHasModelTokens(a.name, requestedModel));
-      if (remainingUsable.length > 0) {
-        log(`automatically failing over request to next account "${remainingUsable[0].name}"...`);
-        continue;
-      } else {
+      // no account left to try
+      if (lastOut && classifyError(lastOut) === 'quota') {
         markQuotaDrained();
         return {
           error: {
             message: 'All ZCode accounts exhausted (upstream code 1005). Wait for daily renewal (19:30) or add more accounts via `zbridge`.',
             type: 'insufficient_quota',
             code: 1005,
-          }
+          },
+          isQuotaExhausted: true,
         };
       }
+      return lastOut || { error: { message: 'no usable ZCode account — run: glm-bridge login' } };
     }
 
-    // Transient upstream errors (concurrency/rate limits, timeouts): retry on
-    // a DIFFERENT account after a short backoff instead of surfacing a 502 to
-    // 9router. Concurrency hits are per-user upstream; another account (a
-    // different Z.ai user) is very likely free.
-    const errText2 = JSON.stringify(out.error);
-    const isTransientErr = /concurrency|rate limit|too many|timeout|timed out|unusual activity|captcha/i.test(errText2);
-    if (isTransientErr && attempt + 1 < maxAttempts) {
-      log(`account "${accName}" transient error (${errText2.slice(0, 120)}), instantly failing over to next account`);
+    const w = got.worker;
+    const accName = w.account.name;
+    let out;
+    try {
+      out = await w.generate(options);
+    } finally {
+      releaseWorker(w);
+    }
+
+    if (!out.error) {
+      clearAccountExhaustion(accName);
+      poolOnSuccess(accName);
+      return out;
+    }
+    if (out.aborted || (options.signal && options.signal.aborted)) return ABORTED();
+
+    lastOut = out;
+    const kind = classifyError(out);
+
+    if (kind === 'quota') {
+      if (requestedModel === 'GLM-5.3-Flash') {
+        log(`account "${accName}" quota exhausted, marking paused`);
+        markAccountExhausted(accName, '1005 quota exhausted');
+      } else {
+        // Only this model's bucket is drained; the account may still have Flash.
+        log(`account "${accName}" has no ${requestedModel} tokens left, trying another account`);
+        blockModel(accName, requestedModel, 10 * 60_000);
+        refreshAccountPlan(loadAccounts().accounts.find(a => a.name === accName)).catch(() => {});
+      }
+      tried.add(accName);
+      continue;    // next loop either finds another account or reports exhaustion
+    }
+
+    if (kind === 'concurrency' || kind === 'transient') {
+      if (kind === 'concurrency') poolOnConcurrencyError(accName);
+      if (out.timedOut && ++timeoutRetries > 1) return out;      // don't stack 5-minute waits
+      if (++retries > MAX_RETRIES || Date.now() - started > TOTAL_BUDGET_MS) {
+        log(`giving up after ${retries - 1} retries: ${JSON.stringify(out.error).slice(0, 200)}`);
+        return out;
+      }
+      const delay = backoffMs(retries);
+      log(`transient upstream error on "${accName}" (${kind}: ${JSON.stringify(out.error).slice(0, 120)}), retry ${retries}/${MAX_RETRIES} in ${delay}ms`);
+      await sleepAbortable(delay, options.signal);
       continue;
     }
-    // Non-quota error: return immediately (failover only covers 1005).
-    return out;
-  }
 
-  return lastOut || { error: { message: 'All accounts failed' } };
+    return out;    // fatal (bad request etc.): retrying cannot help
+  }
 }
 
 // Start plan (rev-30 builtin, CLI 3.14.4): GLM-5.3-Flash, GLM-5.2, GLM-5-Turbo.
@@ -1723,9 +1936,9 @@ function reasoningFromRequest(body) {
   return env || 'low';
 }
 
-function sendJson(res, status, obj) {
+function sendJson(res, status, obj, headers = {}) {
   const body = JSON.stringify(obj);
-  res.writeHead(status, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) });
+  res.writeHead(status, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body), ...headers });
   res.end(body);
 }
 
@@ -1754,8 +1967,51 @@ function toOpenAIToolCalls(toolCalls) {
   }));
 }
 
+// Map an internal failure to what each client family understands, so Claude
+// Code / OpenAI SDKs retry (529 / 503) instead of treating it as a hard error.
+function upstreamErrorInfo(out) {
+  const msg = `upstream: ${(out.error && out.error.message) || JSON.stringify(out.error)}`;
+  const kind = classifyError(out);
+  if (kind === 'quota') return { msg, aStatus: 429, oStatus: 429, aType: 'rate_limit_error', oType: 'insufficient_quota' };
+  if (kind === 'transient' || kind === 'concurrency') {
+    return { msg, aStatus: 529, oStatus: 503, aType: 'overloaded_error', oType: 'server_error', retryAfter: 5 };
+  }
+  return { msg, aStatus: 502, oStatus: 502, aType: 'api_error', oType: 'upstream_error' };
+}
+
+// The text is already fully generated, so there is nothing to gain from one
+// SSE event per word; ~200-char deltas cut CPU on both sides.
+function chunkText(text, size = 200) {
+  const words = text.match(/\S+|\s+/g) || [text];
+  const out = [];
+  let cur = '';
+  for (const w of words) {
+    cur += w;
+    if (cur.length >= size) { out.push(cur); cur = ''; }
+  }
+  if (cur) out.push(cur);
+  return out;
+}
+
+// Generation can take minutes (plus queue time). Without periodic bytes,
+// clients and proxies treat the idle stream as dead and report an API error.
+function startKeepalive(res, payload, ms = 8000) {
+  const t = setInterval(() => {
+    try { if (!res.writableEnded && !res.destroyed) res.write(payload); } catch { /* client gone */ }
+  }, ms);
+  if (t.unref) t.unref();
+  return () => clearInterval(t);
+}
+
+const SSE_HEADERS = {
+  'content-type': 'text/event-stream; charset=utf-8',
+  'cache-control': 'no-cache, no-transform',
+  'connection': 'keep-alive',
+  'x-accel-buffering': 'no',
+};
+
 async function handleChatCompletions(req, res, body) {
-  log(`[chat/completions] model=${body.model} stream=${body.stream} msgs=${(body.messages || []).length} prompt=${JSON.stringify((body.messages || [])[0]?.content || '').slice(0, 60)}`);
+  log(`[chat/completions] model=${body.model} stream=${body.stream} msgs=${(body.messages || []).length}`);
   const requestedModel = body.model || 'GLM-5.3-Flash';
   const model = resolveModel(requestedModel);
   const systemBlocks = [
@@ -1767,34 +2023,34 @@ async function handleChatCompletions(req, res, body) {
 
   const created = Math.floor(Date.now() / 1000);
   const id = 'chatcmpl-' + crypto.randomUUID();
+  const genOpts = () => ({
+    systemBlocks,
+    messages,
+    tools: openaiToolDefs(body.tools),
+    maxOutputTokens: clampMaxTokens(body.max_tokens ?? body.max_completion_tokens),
+    reasoningLevel: reasoningFromRequest(body),
+    modelId: model,
+    signal: req.signal,
+  });
 
   if (body.stream) {
-    res.writeHead(200, {
-      'content-type': 'text/event-stream; charset=utf-8',
-      'cache-control': 'no-cache',
-      'connection': 'keep-alive',
-      'x-accel-buffering': 'no',
-    });
+    res.writeHead(200, SSE_HEADERS);
+    res.flushHeaders();
     const chunk = delta => `data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model: requestedModel, choices: [delta] })}\n\n`;
     res.write(chunk({ index: 0, delta: { role: 'assistant' }, finish_reason: null }));
 
-    const out = await generateWithFailover({
-      systemBlocks,
-      messages,
-      tools: openaiToolDefs(body.tools),
-      maxOutputTokens: clampMaxTokens(body.max_tokens ?? body.max_completion_tokens),
-      reasoningLevel: reasoningFromRequest(body),
-      modelId: model,
-      signal: req.signal,
-      sessionPort: req.socket.remotePort,
-    });
+    const stopKeepalive = startKeepalive(res, ': keepalive\n\n');
+    let out;
+    try { out = await generateWithFailover(genOpts()); } finally { stopKeepalive(); }
+
+    if (req.signal && req.signal.aborted) {
+      log('client aborted; closing stream');
+      res.destroy();
+      return;
+    }
     if (out.error) {
-      if (req.signal && req.signal.aborted) {
-        log('client aborted; terminating stream without 502');
-        res.destroy();
-        return;
-      }
-      res.write(`data: ${JSON.stringify({ error: { message: `upstream: ${out.error.message || JSON.stringify(out.error)}`, type: 'upstream_error' } })}\n\n`);
+      const info = upstreamErrorInfo(out);
+      res.write(`data: ${JSON.stringify({ error: { message: info.msg, type: info.oType } })}\n\n`);
       res.write('data: [DONE]\n\n');
       res.end();
       return;
@@ -1804,39 +2060,31 @@ async function handleChatCompletions(req, res, body) {
     const usage = r.usage || {};
     const finish = toolCalls ? 'tool_calls' : (r.finishReason === 'stop' || !r.finishReason ? 'stop' : r.finishReason);
 
-    if (r.text) {
-      const words = r.text.match(/\S+|\s+/g) || [r.text];
-      for (const w of words) res.write(chunk({ index: 0, delta: { content: w } }));
-    }
-    if (toolCalls) res.write(chunk({ index: 0, delta: { tool_calls: toolCalls.map((t, i) => ({ index: i, ...t })) } }));
-    res.write(chunk({ index: 0, delta: {}, finish_reason: finish }));
+    let payload = '';
+    if (r.text) for (const part of chunkText(r.text)) payload += chunk({ index: 0, delta: { content: part } });
+    if (toolCalls) payload += chunk({ index: 0, delta: { tool_calls: toolCalls.map((t, i) => ({ index: i, ...t })) } });
+    payload += chunk({ index: 0, delta: {}, finish_reason: finish });
     if (body.stream_options && body.stream_options.include_usage) {
-      res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model: requestedModel, choices: [], usage: {
+      payload += `data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model: requestedModel, choices: [], usage: {
         prompt_tokens: usage.inputTokens || 0, completion_tokens: usage.outputTokens || 0, total_tokens: usage.totalTokens || 0,
-      } })}\n\n`);
+      } })}\n\n`;
     }
-    res.write('data: [DONE]\n\n');
+    payload += 'data: [DONE]\n\n';
+    res.write(payload);
     res.end();
     return;
   }
 
-  const out = await generateWithFailover({
-    systemBlocks,
-    messages,
-    tools: openaiToolDefs(body.tools),
-    maxOutputTokens: clampMaxTokens(body.max_tokens ?? body.max_completion_tokens),
-    reasoningLevel: reasoningFromRequest(body),
-    modelId: model,
-    signal: req.signal,
-    sessionPort: req.socket.remotePort,
-  });
+  const out = await generateWithFailover(genOpts());
+  if (req.signal && req.signal.aborted) {
+    log('client aborted; terminating connection');
+    res.destroy();
+    return;
+  }
   if (out.error) {
-    if (req.signal && req.signal.aborted) {
-      log('client aborted; terminating connection without 502');
-      res.destroy();
-      return;
-    }
-    return sendJson(res, 502, { error: { message: `upstream: ${out.error.message || JSON.stringify(out.error)}`, type: 'upstream_error' } });
+    const info = upstreamErrorInfo(out);
+    return sendJson(res, info.oStatus, { error: { message: info.msg, type: info.oType } },
+      info.retryAfter ? { 'retry-after': String(info.retryAfter) } : {});
   }
   const r = out.result || {};
   const toolCalls = (r.toolCalls && r.toolCalls.length) ? toOpenAIToolCalls(r.toolCalls) : null;
@@ -1867,70 +2115,7 @@ async function handleAnthropicMessages(req, res, body, stream) {
   if (!messages.length) return sendJson(res, 400, { type: 'error', error: { type: 'invalid_request_error', message: 'messages required' } });
 
   const id = 'msg_' + crypto.randomUUID().replace(/-/g, '').slice(0, 24);
-  const created = Math.floor(Date.now() / 1000);
-
-  if (stream) {
-    res.writeHead(200, {
-      'content-type': 'text/event-stream; charset=utf-8',
-      'cache-control': 'no-cache',
-      'connection': 'keep-alive',
-      'x-accel-buffering': 'no',
-    });
-    const ev = (event, data) => `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
-    res.write(ev('message_start', { type: 'message_start', message: {
-      id, type: 'message', role: 'assistant', model: requestedModel, content: [],
-      stop_reason: null, stop_sequence: null,
-      usage: { input_tokens: 0, output_tokens: 0 },
-    } }));
-
-    const out = await generateWithFailover({
-      systemBlocks,
-      messages,
-      tools: openaiToolDefs((body.tools || []).map(t => ({
-        type: 'function',
-        function: { name: t.name, description: t.description, parameters: t.input_schema },
-      }))),
-      maxOutputTokens: clampMaxTokens(body.max_tokens),
-      reasoningLevel: reasoningFromRequest(body),
-      modelId: resolveModel(requestedModel),
-      signal: req.signal,
-    });
-    if (out.error) {
-      res.write(ev('error', { type: 'error', error: { type: 'api_error', message: `upstream: ${out.error.message || JSON.stringify(out.error)}` } }));
-      res.end();
-      return;
-    }
-    const r = out.result || {};
-    const stopReason = (r.toolCalls && r.toolCalls.length) ? 'tool_use' : 'end_turn';
-    const usage = r.usage || {};
-    let idx = 0;
-    if (r.text) {
-      res.write(ev('content_block_start', { type: 'content_block_start', index: idx, content_block: { type: 'text', text: '' } }));
-      const words = r.text.match(/\S+|\s+/g) || [r.text];
-      for (const w of words) {
-        res.write(ev('content_block_delta', { type: 'content_block_delta', index: idx, delta: { type: 'text_delta', text: w } }));
-      }
-      res.write(ev('content_block_stop', { type: 'content_block_stop', index: idx }));
-      idx++;
-    }
-    for (const t of (r.toolCalls || [])) {
-      res.write(ev('content_block_start', { type: 'content_block_start', index: idx, content_block: { type: 'tool_use', id: t.id, name: t.name, input: {} } }));
-      res.write(ev('content_block_delta', { type: 'content_block_delta', index: idx, delta: { type: 'input_json_delta', partial_json: JSON.stringify(t.input || {}) } }));
-      res.write(ev('content_block_stop', { type: 'content_block_stop', index: idx }));
-      idx++;
-    }
-    if (idx === 0) {
-      res.write(ev('content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }));
-      res.write(ev('content_block_stop', { type: 'content_block_stop', index: 0 }));
-    }
-    res.write(ev('message_delta', { type: 'message_delta', delta: { stop_reason: stopReason, stop_sequence: null },
-      usage: { output_tokens: usage.outputTokens || 0 } }));
-    res.write(ev('message_stop', { type: 'message_stop' }));
-    res.end();
-    return;
-  }
-
-  const out = await generateWithFailover({
+  const genOpts = () => ({
     systemBlocks,
     messages,
     tools: openaiToolDefs((body.tools || []).map(t => ({
@@ -1941,15 +2126,74 @@ async function handleAnthropicMessages(req, res, body, stream) {
     reasoningLevel: reasoningFromRequest(body),
     modelId: resolveModel(requestedModel),
     signal: req.signal,
-    sessionPort: req.socket.remotePort,
   });
-  if (out.error) {
+
+  if (stream) {
+    res.writeHead(200, SSE_HEADERS);
+    res.flushHeaders();
+    const ev = (event, data) => `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+    res.write(ev('message_start', { type: 'message_start', message: {
+      id, type: 'message', role: 'assistant', model: requestedModel, content: [],
+      stop_reason: null, stop_sequence: null,
+      usage: { input_tokens: 0, output_tokens: 0 },
+    } }));
+
+    const stopKeepalive = startKeepalive(res, ev('ping', { type: 'ping' }));
+    let out;
+    try { out = await generateWithFailover(genOpts()); } finally { stopKeepalive(); }
+
     if (req.signal && req.signal.aborted) {
-      log('client aborted; terminating connection without 502');
+      log('client aborted; closing stream');
       res.destroy();
       return;
     }
-    return sendJson(res, 502, { type: 'error', error: { type: 'api_error', message: `upstream: ${out.error.message || JSON.stringify(out.error)}` } });
+    if (out.error) {
+      const info = upstreamErrorInfo(out);
+      res.write(ev('error', { type: 'error', error: { type: info.aType, message: info.msg } }));
+      res.end();
+      return;
+    }
+    const r = out.result || {};
+    const stopReason = (r.toolCalls && r.toolCalls.length) ? 'tool_use' : 'end_turn';
+    const usage = r.usage || {};
+    let payload = '';
+    let idx = 0;
+    if (r.text) {
+      payload += ev('content_block_start', { type: 'content_block_start', index: idx, content_block: { type: 'text', text: '' } });
+      for (const part of chunkText(r.text)) {
+        payload += ev('content_block_delta', { type: 'content_block_delta', index: idx, delta: { type: 'text_delta', text: part } });
+      }
+      payload += ev('content_block_stop', { type: 'content_block_stop', index: idx });
+      idx++;
+    }
+    for (const t of (r.toolCalls || [])) {
+      payload += ev('content_block_start', { type: 'content_block_start', index: idx, content_block: { type: 'tool_use', id: t.id, name: t.name, input: {} } });
+      payload += ev('content_block_delta', { type: 'content_block_delta', index: idx, delta: { type: 'input_json_delta', partial_json: JSON.stringify(t.input || {}) } });
+      payload += ev('content_block_stop', { type: 'content_block_stop', index: idx });
+      idx++;
+    }
+    if (idx === 0) {
+      payload += ev('content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } });
+      payload += ev('content_block_stop', { type: 'content_block_stop', index: 0 });
+    }
+    payload += ev('message_delta', { type: 'message_delta', delta: { stop_reason: stopReason, stop_sequence: null },
+      usage: { output_tokens: usage.outputTokens || 0 } });
+    payload += ev('message_stop', { type: 'message_stop' });
+    res.write(payload);
+    res.end();
+    return;
+  }
+
+  const out = await generateWithFailover(genOpts());
+  if (req.signal && req.signal.aborted) {
+    log('client aborted; terminating connection');
+    res.destroy();
+    return;
+  }
+  if (out.error) {
+    const info = upstreamErrorInfo(out);
+    return sendJson(res, info.aStatus, { type: 'error', error: { type: info.aType, message: info.msg } },
+      info.retryAfter ? { 'retry-after': String(info.retryAfter) } : {});
   }
   const r = out.result || {};
   const content = [];
@@ -1994,26 +2238,30 @@ const server = http.createServer(async (req, res) => {
   req.signal = ac.signal;
   const url = new URL(req.url, 'http://localhost');
   try {
-    log(`[http] ${req.method} ${url.pathname} from port ${req.socket.remotePort} UA=${req.headers['user-agent'] || 'none'}`);
+    if (url.pathname !== '/health') log(`[http] ${req.method} ${url.pathname} from port ${req.socket.remotePort} UA=${req.headers['user-agent'] || 'none'}`);
     if (req.method === 'GET' && url.pathname === '/health') {
       const accountsData = loadAccounts();
       const anyCreds = accountsData.accounts.some(a => fs.existsSync(accountCredFile(a)));
-      const clients = Array.from(clientPool.values());
-      const cliRunning = clients.some(c => c.child && c.child.exitCode === null);
-      const anyReady = clients.some(c => c.ready);
-      const activeC = getClientForAccount(activeAccount());
+      const allWorkers = [...accountPools.values()].flatMap(p => p.workers.filter(w => !w.destroyed));
+      const cliRunning = allWorkers.some(c => c.child && c.child.exitCode === null);
+      const anyReady = allWorkers.some(c => c.ready);
+      const activeWorkers = (accountPools.get(activeAccount().name) || { workers: [] }).workers;
+      const activeC = activeWorkers.find(c => c.ready) || activeWorkers[0] || null;
 
       const accountsList = accountsData.accounts.map(a => {
         const hasCreds = fs.existsSync(accountCredFile(a));
         const p = accountPlans.get(a.name);
-        const c = clientPool.get(a.name);
+        const ps = poolStats(a.name);
         const isExhausted = !!((a.exhaustedUntil && a.exhaustedUntil > Date.now()) ||
                                (a.quotaEmptyUntil && a.quotaEmptyUntil > Date.now()));
         return {
           name: a.name,
           active: a.name === accountsData.active,
           hasCredentials: hasCreds,
-          ready: !!(c && c.ready),
+          ready: ps.ready > 0,
+          workers: ps.workers,
+          busy: ps.busy,
+          concurrencyLimit: ps.limit,
           exhausted: isExhausted,
           exhaustedUntil: a.exhaustedUntil || null,
           quotaEmptyUntil: a.quotaEmptyUntil || null,
@@ -2047,6 +2295,9 @@ const server = http.createServer(async (req, res) => {
         accounts: accountsData.accounts.length,
         accountsList,
         captchaPool: tokens.length,
+        queue: waiters.length,
+        inflight: allWorkers.filter(w => w.busy).length,
+        workersPerAccount: WORKERS_MAX,
         cliRunning,
         credentials: anyCreds,
         quota: drained ? 'drained' : 'ok',
@@ -2065,7 +2316,7 @@ const server = http.createServer(async (req, res) => {
       });
     }
     if (req.method === 'POST' && url.pathname === '/reload') {
-      warmClientPool();
+      warmPools();
       refreshPlan().catch(() => {});
       return sendJson(res, 200, { ok: true, accounts: loadAccounts().accounts.length });
     }
@@ -2105,6 +2356,17 @@ const server = http.createServer(async (req, res) => {
 });
 
 const created_ts = Math.floor(Date.now() / 1000);
+
+// Node's default keep-alive timeout is 5s: a client reusing a pooled
+// connection right as the server closes it gets ECONNRESET, which shows up as
+// random "API error"s in Claude Code. Keep idle connections far longer than
+// any client does, and never time out a long generation.
+server.keepAliveTimeout = 65_000;
+server.headersTimeout = 66_000;
+server.requestTimeout = 0;
+server.timeout = 0;
+server.on('connection', s => { s.setNoDelay(true); s.setKeepAlive(true, 30_000); });
+server.on('clientError', (err, socket) => { try { socket.destroy(); } catch { /* ignore */ } });
 
 // ------------------------------------------------------------- CLI wrapper ---
 // `glm-bridge start|stop|restart|status|logs|run` — cross-platform.
@@ -2743,6 +3005,10 @@ async function main() {
 }
 
 function boot() {
+  rotateLogIfBig();
+  // A stray exception in one request path must not take every session down.
+  process.on('uncaughtException', e => log('uncaughtException:', e && e.stack || e));
+  process.on('unhandledRejection', e => log('unhandledRejection:', e && e.stack || e));
   writePid(process.pid);
   loadTokens();
   saveTokens();
@@ -2755,8 +3021,9 @@ function boot() {
   // non-direct route, the periodic checker respawns the child (SIGHUP ->
   // exit handler) so it inherits the proxy env. This keeps /health truthful
   // within seconds on machines where every probe times out (VPN off etc.).
-  warmClientPool();
+  warmPools();
   resolveProxy(true)
+    .then(() => { if (resolvedProxy) recyclePools(); })   // children started before the route was known
     .then(() => refreshPlan())          // warm plan cache for /health actions
     .then(() => captchaPolicyRequired())
     .then(() => { if (tokens.length < 4) ensureTokens(); })   // pre-warm for GLM-5.3
@@ -2799,9 +3066,11 @@ function boot() {
     const before = resolvedProxy;
     await resolveProxy(true);
     if (resolvedProxy !== before) {
-      log(`connectivity changed (${before || 'direct'} -> ${resolvedProxy || 'direct'}), respawning client pool`);
-      respawnClientPool();
+      log(`connectivity changed (${before || 'direct'} -> ${resolvedProxy || 'direct'}), recycling workers when idle`);
+      recyclePools();
     }
+    reapIdleWorkers();
+    warmPools();
     // Always keep a small captcha pool: GLM-5.3 (premium) requests MUST carry
     // a token or the upstream silently downgrades them to Flash (billing the
     // Flash bucket). Minting ~60s/token means the pool must be pre-warmed,
@@ -2815,7 +3084,7 @@ function boot() {
       // Kill the tray helper too: it lives in this cgroup, and systemd would
       // otherwise wait for it, time out and mark the unit failed on every stop.
       try { killTray(); } catch { /* ignore */ }
-      try { shutdownClientPool(); } catch { /* ignore */ }
+      try { shutdownPools(); } catch { /* ignore */ }
       try { fs.rmSync(PID_PATH, { force: true }); } catch {}
       server.close(() => process.exit(0));
       setTimeout(() => process.exit(0), 2000);
