@@ -1084,18 +1084,34 @@ class ZcodeClient {
     } catch (e) { log('stdin write failed:', e.message); }
   }
 
-  send(method, params, timeoutMs = 30_000) {
+  send(method, params, timeoutMs = 30_000, signal = null) {
     return new Promise(resolve => {
       if (!this.child || !this.child.stdin.writable) {
         resolve({ error: { message: 'CLI not running' } });
         return;
       }
+      if (signal && signal.aborted) {
+        resolve({ error: { message: 'request aborted by client' } });
+        return;
+      }
       const id = 'req_' + (++this.id);
       const tStart = Date.now();
-      this.pending.set(id, { resolve });
-      setTimeout(() => {
+      let timer = null;
+      let onAbort = null;
+      const cleanup = () => {
+        if (timer) { clearTimeout(timer); timer = null; }
+        if (signal && onAbort) signal.removeEventListener('abort', onAbort);
+      };
+      this.pending.set(id, {
+        resolve: val => {
+          cleanup();
+          resolve(val);
+        }
+      });
+      timer = setTimeout(() => {
         if (this.pending.has(id)) {
           this.pending.delete(id);
+          cleanup();
           const elapsed = Date.now() - tStart;
           log(`[send TIMEOUT acc=${this.account ? this.account.name : '?'}] ${id} ${method} elapsed=${elapsed}ms timeoutMs=${timeoutMs}`);
           try {
@@ -1108,6 +1124,16 @@ class ZcodeClient {
           resolve({ error: { message: `timeout waiting for ${method}` } });
         }
       }, timeoutMs);
+      if (signal) {
+        onAbort = () => {
+          if (this.pending.has(id)) {
+            this.pending.delete(id);
+            cleanup();
+            resolve({ error: { message: 'request aborted by client' } });
+          }
+        };
+        signal.addEventListener('abort', onAbort, { once: true });
+      }
       this.child.stdin.write(JSON.stringify({ id, method, params }) + '\n');
     });
   }
@@ -1179,7 +1205,8 @@ class ZcodeClient {
         };
         signal.addEventListener('abort', onAbort, { once: true });
       }
-      const sendOnce = () => this.send('workspace/generateText', params, 75_000);
+      const sendTimeoutMs = Number(process.env.GLM_BRIDGE_TIMEOUT_MS) || 300_000;
+      const sendOnce = () => this.send('workspace/generateText', params, sendTimeoutMs, signal);
       let r;
       try {
         r = await sendOnce();
@@ -1250,7 +1277,8 @@ class ZcodeClient {
         log('empty length-truncated response, retrying with maxOutputTokens=8192');
         params.maxOutputTokens = 8192;
         params.operationId = 'op-' + crypto.randomUUID();
-        const r2 = await this.send('workspace/generateText', params, 75_000);
+        const sendTimeoutMs = Number(process.env.GLM_BRIDGE_TIMEOUT_MS) || 300_000;
+        const r2 = await this.send('workspace/generateText', params, sendTimeoutMs, signal);
         if (r2.result) result = r2.result;
         else if (r2.error) return { error: r2.error };
       }
@@ -1480,6 +1508,10 @@ async function generateWithFailover(options) {
   let lastOut = null;
 
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    if (options.signal && options.signal.aborted) {
+      log('request already aborted by client, skipping failover');
+      return lastOut || { error: { message: 'request aborted by client' } };
+    }
     const c = getNextClient(triedAccounts, requestedModel);
     if (!c) break;
     const accName = (c && c.account) ? c.account.name : activeAccount().name;
@@ -1487,7 +1519,10 @@ async function generateWithFailover(options) {
     log(`dispatching request to account "${accName}" (mode: ${getRoutingMode()})`);
 
     let out = await c.generate(options);
-
+    if (options.signal && options.signal.aborted) {
+      log(`request aborted by client (acc=${accName}), stopping failover`);
+      return out;
+    }
     // Per-model empty: if this account drained the bucket covering the
     // requested model but OTHER accounts still have tokens for it, retry
     // there instead of failing over the whole request.
@@ -1840,6 +1875,13 @@ function checkAuth(req) {
 }
 
 const server = http.createServer(async (req, res) => {
+  const ac = new AbortController();
+  res.on('close', () => {
+    if (!res.writableFinished) {
+      ac.abort();
+    }
+  });
+  req.signal = ac.signal;
   const url = new URL(req.url, 'http://localhost');
   try {
     log(`[http] ${req.method} ${url.pathname} from port ${req.socket.remotePort} UA=${req.headers['user-agent'] || 'none'}`);
