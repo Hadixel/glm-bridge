@@ -316,6 +316,39 @@ function loadJwt(acc) {
     return null;
   }
 }
+// Stable per-Z.AI-account id, read from the stored JWT subject. Two accounts
+// with the same id are the same upstream login: they share one plan, one
+// daily quota and one 100M offer, so a duplicate entry buys nothing.
+function zaiUserId(acc) {
+  const jwt = loadJwt(acc);
+  if (!jwt) return null;
+  try {
+    const payload = JSON.parse(Buffer.from(jwt.split('.')[1], 'base64url').toString('utf8'));
+    return payload.sub || payload.user_id || payload.uid || null;
+  } catch {
+    return null;
+  }
+}
+
+// Which other account (if any) already holds this Z.AI login.
+function duplicateOf(acc, accs) {
+  const id = zaiUserId(acc);
+  if (!id) return null;
+  const all = accs || loadAccounts().accounts;
+  return all.find(a => a.name !== acc.name && zaiUserId(a) === id) || null;
+}
+
+// Accounts are selectable by 1-based index (`use 2`) or by name (`use ha work`).
+function resolveAccountRef(accs, ref) {
+  const list = accs.accounts;
+  const raw = String(ref ?? '').trim();
+  if (!raw) return null;
+  if (/^\d+$/.test(raw)) {
+    const i = Number(raw) - 1;
+    return i >= 0 && i < list.length ? list[i] : null;
+  }
+  return list.find(a => a.name === raw) || null;
+}
 
 // ----------------------------------------------------------- captcha mint ----
 // One Aliyun captcha device token per pool entry; scene from ZCode client config.
@@ -2581,12 +2614,17 @@ function startTray() {
 }
 
 // ------------------------------------------------------ account commands ----
-async function cliLogin(name) {
+async function cliLogin(ref) {
   const cli = resolveCliRoot();
   if (!cli) { console.error('zcode.cjs not found — install ZCode first (or set GLM_BRIDGE_CLI)'); process.exitCode = 1; return; }
   const builtin = findBuiltinFile();
   const accs = loadAccounts();
-  let acc = name ? accs.accounts.find(a => a.name === name) : null;
+  const name = String(ref ?? '').trim();
+  let acc = name ? resolveAccountRef(accs, name) : null;
+  if (name && !acc && /^\d+$/.test(name)) {
+    console.error(`account #${name} does not exist (see: glm-bridge accounts)`);
+    process.exitCode = 1; return;
+  }
   if (name && !acc) {
     // new account: its own data base dir under STATE_DIR/accounts/<name>
     const dir = path.join(STATE_DIR, 'accounts', name);
@@ -2597,6 +2635,17 @@ async function cliLogin(name) {
     console.log(`created account "${name}" -> ${dir}`);
   }
   if (!acc) acc = activeAccount();
+  // Refuse before the OAuth dance: signing in with an account that is already
+  // linked elsewhere just creates a second name for one quota/plan.
+  const dupBefore = duplicateOf(acc, accs.accounts);
+  if (dupBefore) {
+    console.error(`✖ "${acc.name}" is already signed in as the same Z.AI account as "${dupBefore.name}".`);
+    console.error(`  Signing in again would share one plan/quota — no extra capacity.`);
+    console.error(`  Use a different Z.AI account (incognito/private window), or drop the old entry first:`);
+    console.error(`    glm-bridge logout ${dupBefore.name}`);
+    process.exitCode = 1;
+    return;
+  }
   const env = {
     ...process.env, ...proxyEnv(),
     ZCODE_DATA_BASE_DIR: acc.dir,
@@ -2681,6 +2730,19 @@ async function cliLogin(name) {
 
   if (loginCode === 0 && fs.existsSync(accountCredFile(acc))) {
     credCache.clear();
+    // Post-login guard: if the sign-in landed on an account that is already
+    // linked under another name, undo it — the new credentials would just
+    // duplicate a plan. Wiping them also restores the previous (different)
+    // login for this entry.
+    const dupAfter = duplicateOf(acc, accs.accounts);
+    if (dupAfter) {
+      fs.rmSync(accountCredFile(acc), { force: true });
+      credCache.clear();
+      console.error(`\n✖ That Z.AI account is already linked as "${dupAfter.name}".`);
+      console.error(`  Reverted: credentials for "${acc.name}" were discarded so the two entries do not share one plan.`);
+      process.exitCode = 1;
+      return;
+    }
     clearAccountExhaustion(acc.name);
     console.log(`\n✔ Login successful for "${acc.name}"!`);
     // Auto-claim: a fresh account only carries the baseline 3M+5M daily plan;
@@ -2720,7 +2782,7 @@ async function cliLogin(name) {
       console.log(`  Initial Quota: ${plan.quotaLeft}`);
     }
     if (accs.active !== acc.name && name) {
-      console.log(`  Switch active account: glm-bridge use ${name}`);
+      console.log(`  Switch active account: glm-bridge use "${acc.name}"`);
     }
     try {
       await fetch(`http://127.0.0.1:${config.port}/reload`, { method: 'POST', signal: AbortSignal.timeout(1500) });
@@ -2733,10 +2795,10 @@ async function cliLogin(name) {
     process.exitCode = 1;
   }
 }
-function cliLogout(name) {
+function cliLogout(ref) {
   const accs = loadAccounts();
-  const acc = name ? accs.accounts.find(a => a.name === name) : activeAccount();
-  if (!acc) { console.error(`account "${name}" not found`); process.exitCode = 1; return; }
+  const acc = ref ? resolveAccountRef(accs, ref) : activeAccount();
+  if (!acc) { console.error(`account "${ref}" not found`); process.exitCode = 1; return; }
   fs.rmSync(accountCredFile(acc), { force: true });
   if (acc.name === 'main') {
     // also ask the CLI to clear shared state it may hold for $HOME
@@ -2751,25 +2813,29 @@ function listAccounts() {
   const a = loadAccounts();
   const routing = getRoutingMode();
   console.log(`Routing mode: ${routing}\n`);
-  for (const x of a.accounts) {
+  a.accounts.forEach((x, i) => {
     const loggedIn = fs.existsSync(accountCredFile(x));
     const exhausted = (x.exhaustedUntil && x.exhaustedUntil > Date.now()) || (x.quotaEmptyUntil && x.quotaEmptyUntil > Date.now());
     const reason = x.exhaustedUntil ? `exhausted-until ${new Date(x.exhaustedUntil).toLocaleTimeString()}` : (x.quotaEmptyUntil ? 'quota-empty' : '');
     const p = accountPlans.get(x.name);
     const qStr = p && p.quotaLeft ? `\t${p.quotaLeft}` : '';
-    console.log(`${x.name === a.active ? '*' : ' '} ${x.name}\t${loggedIn ? 'logged-in' : 'no-credentials'}` +
-      `${exhausted ? '\t' + reason : '\tactive'}${qStr}\t${x.dir}`);
-  }
+    const dup = loggedIn ? duplicateOf(x, a.accounts) : null;
+    const dupStr = dup ? `\tDUPLICATE of "${dup.name}"` : '';
+    console.log(`${x.name === a.active ? '*' : ' '} ${i + 1}. ${x.name}\t${loggedIn ? 'logged-in' : 'no-credentials'}` +
+      `${exhausted ? '\t' + reason : '\tactive'}${qStr}${dupStr}\t${x.dir}`);
+  });
 }
-function useAccount(name) {
-  if (!name) { console.error('usage: glm-bridge use <name>'); process.exitCode = 1; return; }
+function useAccount(ref) {
+  if (!ref) { console.error('usage: glm-bridge use <number|name>'); process.exitCode = 1; return; }
   const a = loadAccounts();
-  const acc = a.accounts.find(x => x.name === name);
-  if (!acc) { console.error(`account "${name}" not found (see: glm-bridge accounts)`); process.exitCode = 1; return; }
-  if (!fs.existsSync(accountCredFile(acc))) console.warn(`warn: "${name}" has no credentials — run: glm-bridge login ${name}`);
-  a.active = name; saveAccounts(a);
+  const acc = resolveAccountRef(a, ref);
+  if (!acc) { console.error(`account "${ref}" not found (see: glm-bridge accounts)`); process.exitCode = 1; return; }
+  const dup = duplicateOf(acc, a.accounts);
+  if (dup) console.warn(`warn: "${acc.name}" is the same Z.AI login as "${dup.name}" — shared quota, no extra capacity`);
+  if (!fs.existsSync(accountCredFile(acc))) console.warn(`warn: "${acc.name}" has no credentials — run: glm-bridge login ${acc.name}`);
+  a.active = acc.name; saveAccounts(a);
   credCache.clear();
-  console.log(`active account: ${name}`);
+  console.log(`active account: ${acc.name}`);
 }
 
 async function ctl() {
@@ -2957,7 +3023,7 @@ async function ctl() {
   } else if (sub === 'run') {
     // handled in main()
   } else if (sub === 'help' || sub === '--help' || sub === '-h') {
-    console.log('usage: glm-bridge [start|stop|restart|status|logs [n]|run|claim [--force]|quit|tray|autostart|autostart-toggle|login [name]|logout [name]|accounts|use <name>]');
+    console.log('usage: glm-bridge [start|stop|restart|status|logs [n]|run|claim [--force]|quit|tray|autostart|autostart-toggle|login [number|name]|logout [number|name]|accounts|use <number|name>]');
   } else {
     console.error(`unknown command: ${sub}`);
     process.exitCode = 1;
