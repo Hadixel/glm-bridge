@@ -1054,7 +1054,11 @@ function resolveCliRoot() {
 const rejectedModels = new Set();
 const QUOTA_RE = /exceed quota|\b1005\b|balance.*empty|insufficient.*quota/i;
 const CONC_RE = /concurren|rate.?limit|too many (?:requests|concurrent)|\b(?:1302|1303|1305|429)\b|overload/i;
-const TRANSIENT_RE = /timeout|timed out|unusual activity|captcha|CLI exited|CLI not running|CLI write failed|warming up|ECONNRESET|ECONNREFUSED|EPIPE|socket hang up|fetch failed|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|network|\b(?:502|503|504|529)\b|temporar|unavailable|internal server error/i;
+// "Provider returned a business error" is the AI SDK's wrapper for a 2xx
+// response carrying an error body — an upstream blip, not a client mistake.
+// Quota is matched earlier (QUOTA_RE), so a retry here cannot hammer an
+// already-drained account; MAX_RETRIES/TOTAL_BUDGET_MS bound the attempts.
+const TRANSIENT_RE = /timeout|timed out|unusual activity|captcha|CLI exited|CLI not running|CLI write failed|warming up|ECONNRESET|ECONNREFUSED|EPIPE|socket hang up|fetch failed|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|network|\b(?:502|503|504|529)\b|temporar|unavailable|internal server error|business error/i;
 
 // loadAccountRevision parses desktop log files synchronously; with several
 // workers starting at once that would repeat the same work. Memoize briefly.
