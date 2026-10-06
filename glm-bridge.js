@@ -1957,20 +1957,22 @@ function clampMaxTokens(n, dflt = 8192) {
 }
 
 function reasoningFromRequest(body) {
-  // GLM spends most of its wall time on "thinking" at max effort: the visible
-  // text only appears afterwards, so harnesses measure a low t/s. Default to
-  // the level ZCode's own thinking budget maps to fastest-but-usable, and let
-  // the caller (or GLM_BRIDGE_REASONING) opt into slower/deeper thinking.
+  // ZCode validates reasoningLevel against the model's declared vocabulary and
+  // drops an unsupported value without an error (bpe()/eZe() in zcode.cjs).
+  // GLM-5.3 / GLM-5.3-Flash declare exactly ["low","high","max"].
+  const map = v => (v === 'high' ? 'high' : (v === 'max' || v === 'xhigh' ? 'max' : 'low'));
   const env = (process.env.GLM_BRIDGE_REASONING || '').toLowerCase();
   const eff = (body.reasoning_effort || body.reasoningEffort || '').toLowerCase();
-  const pick = v => (v === 'low' || v === 'high' || v === 'max' ? v : (env || 'low'));
-  if (eff) return pick(eff === 'minimal' ? 'low' : eff);
+  // An explicit per-request hint wins; then the operator's global opt-in. Both
+  // real clients (omp, Claude Code via 9router) send thinking:{type:'enabled'},
+  // so the env override must be consulted before that branch or it is dead.
+  if (eff) return map(eff);
+  if (env) return map(env);
   if (body.thinking && body.thinking.type === 'enabled') {
-    // Anthropic thinking budget: small budgets mean the caller wants it cheap.
     const b = Number(body.thinking.budget_tokens || 0);
-    return env || (b && b <= 4096 ? 'low' : 'high');
+    return b && b <= 4096 ? 'low' : 'high';
   }
-  return env || 'low';
+  return 'low';
 }
 
 function sendJson(res, status, obj, headers = {}) {
@@ -2028,6 +2030,15 @@ function chunkText(text, size = 200) {
   }
   if (cur) out.push(cur);
   return out;
+}
+
+// ZCode returns reasoning as [{type:'reasoning', text}]; clients want one blob.
+function thinkingText(r) {
+  const parts = r && r.reasoning;
+  if (!Array.isArray(parts) || !parts.length) return '';
+  return parts
+    .map(p => (typeof p === 'string' ? p : (p && typeof p.text === 'string' ? p.text : '')))
+    .join('');
 }
 
 // Generation can take minutes (plus queue time). Without periodic bytes,
@@ -2098,6 +2109,8 @@ async function handleChatCompletions(req, res, body) {
     const finish = toolCalls ? 'tool_calls' : (r.finishReason === 'stop' || !r.finishReason ? 'stop' : r.finishReason);
 
     let payload = '';
+    const think = thinkingText(r);
+    if (think) payload += chunk({ index: 0, delta: { reasoning_content: think } });
     if (r.text) for (const part of chunkText(r.text)) payload += chunk({ index: 0, delta: { content: part } });
     if (toolCalls) payload += chunk({ index: 0, delta: { tool_calls: toolCalls.map((t, i) => ({ index: i, ...t })) } });
     payload += chunk({ index: 0, delta: {}, finish_reason: finish });
@@ -2127,6 +2140,8 @@ async function handleChatCompletions(req, res, body) {
   const toolCalls = (r.toolCalls && r.toolCalls.length) ? toOpenAIToolCalls(r.toolCalls) : null;
   const usage = r.usage || {};
   const message = { role: 'assistant', content: r.text || '' };
+  const think = thinkingText(r);
+  if (think) message.reasoning_content = think;
   if (toolCalls) message.tool_calls = toolCalls;
   const finish = toolCalls ? 'tool_calls' : (r.finishReason === 'stop' || !r.finishReason ? 'stop' : r.finishReason);
   sendJson(res, 200, {
@@ -2195,6 +2210,15 @@ async function handleAnthropicMessages(req, res, body, stream) {
     const usage = r.usage || {};
     let payload = '';
     let idx = 0;
+    const think = thinkingText(r);
+    if (think) {
+      payload += ev('content_block_start', { type: 'content_block_start', index: idx, content_block: { type: 'thinking', thinking: '' } });
+      for (const part of chunkText(think)) {
+        payload += ev('content_block_delta', { type: 'content_block_delta', index: idx, delta: { type: 'thinking_delta', thinking: part } });
+      }
+      payload += ev('content_block_stop', { type: 'content_block_stop', index: idx });
+      idx++;
+    }
     if (r.text) {
       payload += ev('content_block_start', { type: 'content_block_start', index: idx, content_block: { type: 'text', text: '' } });
       for (const part of chunkText(r.text)) {
@@ -2234,6 +2258,8 @@ async function handleAnthropicMessages(req, res, body, stream) {
   }
   const r = out.result || {};
   const content = [];
+  const think = thinkingText(r);
+  if (think) content.push({ type: 'thinking', thinking: think });
   if (r.text) content.push({ type: 'text', text: r.text });
   for (const t of (r.toolCalls || [])) content.push({ type: 'tool_use', id: t.id, name: t.name, input: t.input || {} });
   const stopReason = (r.toolCalls && r.toolCalls.length) ? 'tool_use' : 'end_turn';
@@ -2680,34 +2706,47 @@ async function cliLogin(ref) {
       if (process.platform === 'win32') args.push('--no-browser');
       const p = spawn(process.execPath, args, { env, stdio: ['inherit', 'pipe', 'pipe'] });
       let urlFound = false;
+      // stdout arrives in chunks; a long authorize URL can straddle a
+      // chunk boundary, so the per-chunk regex captures only the head
+      // ("...?client_id=xxx"). Z.ai rejects that with a 422 "Field
+      // required" for response_type/redirect_uri/state. Buffer the whole
+      // stream and only open a URL that carries every OAuth param.
+      let outBuf = '';
+      const AUTH_PARAMS = ['response_type', 'redirect_uri', 'state'];
+      const openAuthUrl = authUrl => {
+        urlFound = true;
+        // Windows-safe auto-open: quote the URL for cmd's `start`.
+        try {
+          if (process.platform === 'win32') {
+            spawn('cmd.exe', ['/c', 'start', '', authUrl], { detached: true, stdio: 'ignore' }).unref();
+          } else if (process.platform === 'darwin') {
+            spawn('open', [authUrl], { detached: true, stdio: 'ignore' }).unref();
+          } else {
+            spawn('xdg-open', [authUrl], { detached: true, stdio: 'ignore' }).unref();
+          }
+          console.log(`Opening your browser...\n`);
+        } catch { /* fall back to manual copy/paste */ }
+        console.log(`\n┌────────────────────────────────────────────────────────────────────────┐`);
+        console.log(`│  AUTHORIZATION LINK:                                                   │`);
+        console.log(`│                                                                        │`);
+        console.log(`│  ${authUrl}`);
+        console.log(`│                                                                        │`);
+        console.log(`│  ★ TO LINK A SECOND / DIFFERENT ACCOUNT:                               │`);
+        console.log(`│    Open this link in a PRIVATE / INCOGNITO browser window so you can   │`);
+        console.log(`│    sign in with a DIFFERENT phone number / account!                    │`);
+        console.log(`└────────────────────────────────────────────────────────────────────────┘\n`);
+        console.log(`Waiting for sign-in completion in browser (or Ctrl+C to cancel)...\n`);
+      };
 
       const onData = (chunk) => {
         const text = chunk.toString();
-        const urlMatch = text.match(/https:\/\/chat\.z\.ai\/api\/oauth\/authorize\S+/);
+        outBuf += text;
+        const urlMatch = outBuf.match(/https:\/\/chat\.z\.ai\/api\/oauth\/authorize\S+/);
         if (urlMatch && !urlFound) {
-          urlFound = true;
           const authUrl = urlMatch[0];
-          // Windows-safe auto-open: quote the URL for cmd's `start`.
-          try {
-            if (process.platform === 'win32') {
-              spawn('cmd.exe', ['/c', 'start', '', authUrl], { detached: true, stdio: 'ignore' }).unref();
-            } else if (process.platform === 'darwin') {
-              spawn('open', [authUrl], { detached: true, stdio: 'ignore' }).unref();
-            } else {
-              spawn('xdg-open', [authUrl], { detached: true, stdio: 'ignore' }).unref();
-            }
-            console.log(`Opening your browser...\n`);
-          } catch { /* fall back to manual copy/paste */ }
-          console.log(`\n┌────────────────────────────────────────────────────────────────────────┐`);
-          console.log(`│  AUTHORIZATION LINK:                                                   │`);
-          console.log(`│                                                                        │`);
-          console.log(`│  ${authUrl}`);
-          console.log(`│                                                                        │`);
-          console.log(`│  ★ TO LINK A SECOND / DIFFERENT ACCOUNT:                               │`);
-          console.log(`│    Open this link in a PRIVATE / INCOGNITO browser window so you can   │`);
-          console.log(`│    sign in with a DIFFERENT phone number / account!                    │`);
-          console.log(`└────────────────────────────────────────────────────────────────────────┘\n`);
-          console.log(`Waiting for sign-in completion in browser (or Ctrl+C to cancel)...\n`);
+          const missing = AUTH_PARAMS.filter(k => !authUrl.includes(k + '='));
+          if (missing.length) return; // rest of the URL still arriving
+          openAuthUrl(authUrl);
         } else if (!urlFound) {
           process.stdout.write(text);
         }
@@ -2718,7 +2757,16 @@ async function cliLogin(ref) {
         const s = d.toString();
         if (!s.includes('ZCode Built-in Provider Config')) process.stderr.write(s);
       });
-      p.on('exit', code => resolve(code === 0 ? 0 : 1));
+      p.on('exit', code => {
+        // Child may exit with a still-incomplete URL (truncated by the
+        // CLI). Open whatever we captured so the user sees it rather
+        // than silently losing the login.
+        if (!urlFound) {
+          const urlMatch = outBuf.match(/https:\/\/chat\.z\.ai\/api\/oauth\/authorize\S+/);
+          if (urlMatch) openAuthUrl(urlMatch[0]);
+        }
+        resolve(code === 0 ? 0 : 1);
+      });
     });
     // Success criteria: fresh credentials written during THIS login attempt.
     const credFile = accountCredFile(acc);
@@ -3079,14 +3127,28 @@ function boot() {
   // A stray exception in one request path must not take every session down.
   process.on('uncaughtException', e => log('uncaughtException:', e && e.stack || e));
   process.on('unhandledRejection', e => log('unhandledRejection:', e && e.stack || e));
-  writePid(process.pid);
+  // A fresh install or a relocated GLM_BRIDGE_HOME may not have the
+  // state dir yet. Without it writePid/saveTokens throw ENOENT and
+  // the bridge dies before server.listen, so /health never answers
+  // and the installer hangs at "waiting for the bridge to become
+  // ready". Ensure the dir exists and never let these block startup.
+  try { fs.mkdirSync(STATE_DIR, { recursive: true }); } catch { /* ignore */ }
+  try { writePid(process.pid); } catch (e) { log('writePid failed:', e.message); }
   loadTokens();
-  saveTokens();
+  try { saveTokens(); } catch (e) { log('saveTokens failed:', e.message); }
 
   server.listen(config.port, '127.0.0.1', () => {
     log(`glm-bridge listening on http://127.0.0.1:${config.port}/v1 (key: ${config.key})`);
   });
 
+  try {
+    const cli = resolveCliRoot();
+    if (!cli) log('zcode.cjs not found — reasoning passthrough cannot be verified');
+    else if (fs.readFileSync(cli, 'utf8').includes('reasoning:u.reasoning'))
+      log('zcode.cjs reasoning passthrough: APPLIED');
+    else
+      log('WARN: zcode.cjs reasoning passthrough MISSING — no thinking blocks (re-apply steps 2-4 after a ZCode update)');
+  } catch {}
   // Spawn the CLI immediately; when the connectivity probe settles on a
   // non-direct route, the periodic checker respawns the child (SIGHUP ->
   // exit handler) so it inherits the proxy env. This keeps /health truthful

@@ -192,13 +192,41 @@ fi
 
 # ------------------------------------------------------------- readiness -----
 say "waiting for the bridge to become ready..."
+poll_health() {
+  local i
+  for i in $(seq 1 30); do
+    # --max-time keeps a slow/hung bridge from wedging the
+    # installer: without it curl blocks forever once the
+    # socket accepts.
+    if curl -fsS --max-time 2 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then return 0; fi
+    sleep 1
+  done
+  return 1
+}
 ready=0
-for _ in $(seq 1 90); do
-  if curl -fsS "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then ready=1; break; fi
-  sleep 1
-done
+poll_health && ready=1
+
+# Self-heal: the usual cause on a fresh machine is a user systemd
+# manager that is not kept alive between logins, so the unit "starts"
+# but never runs. Keep the user manager alive, restart, and re-poll.
+if [ "$ready" = 0 ] && command -v systemctl >/dev/null 2>&1 \
+   && systemctl --user show-environment >/dev/null 2>&1; then
+  say "bridge not ready — retrying with a persistent user session"
+  loginctl enable-linger "$(id -un)" >/dev/null 2>&1 || true
+  systemctl --user daemon-reload >/dev/null 2>&1 || true
+  systemctl --user restart "$SERVICE.service" >/dev/null 2>&1 || true
+  poll_health && ready=1
+fi
+
+# Last resort: run the bridge directly, with no systemd dependency.
+if [ "$ready" = 0 ]; then
+  say "systemd did not bring the bridge up — starting it directly"
+  "$NODE_BIN" "$INSTALL_DIR/glm-bridge.js" start >/dev/null 2>&1 || true
+  poll_health && ready=1
+fi
+
 if [ "$ready" = 1 ]; then
-  HEALTH=$(curl -fsS "http://127.0.0.1:$PORT/health" || true)
+  HEALTH=$(curl -fsS --max-time 3 "http://127.0.0.1:$PORT/health" || true)
   say "health: $HEALTH"
 else
   say "warn: not ready yet — check: $BIN_DIR/glm-bridge logs"
@@ -276,7 +304,7 @@ const req = (method, p, body) => new Promise((resolve, reject) => {
 NODE9R
 }
 
-if [ "$REGISTER_9ROUTER" != "no" ] && curl -fsS "http://127.0.0.1:20128/api/health" >/dev/null 2>&1; then
+if [ "$REGISTER_9ROUTER" != "no" ] && curl -fsS --max-time 3 "http://127.0.0.1:20128/api/health" >/dev/null 2>&1; then
   register_9router || say "warn: 9router registration failed (bridge still usable directly)"
 else
   [ "$REGISTER_9ROUTER" = "yes" ] && say "9router not reachable on :20128 — skipped"
