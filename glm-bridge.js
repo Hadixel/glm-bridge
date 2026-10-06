@@ -3144,7 +3144,7 @@ function boot() {
   try {
     const cli = resolveCliRoot();
     if (!cli) log('zcode.cjs not found — reasoning passthrough cannot be verified');
-    else if (fs.readFileSync(cli, 'utf8').includes('reasoning:u.reasoning'))
+    else if (fs.readFileSync(cli, 'utf8').includes('.reasoning.length?{reasoning:'))
       log('zcode.cjs reasoning passthrough: APPLIED');
     else
       log('WARN: zcode.cjs reasoning passthrough MISSING — no thinking blocks (re-apply steps 2-4 after a ZCode update)');

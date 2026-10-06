@@ -12,11 +12,23 @@ The bridge drives ZCode's own agent CLI over its internal protocol and calls a r
 curl -fsSL https://raw.githubusercontent.com/Hadixel/glm-bridge/main/install.sh | bash
 ```
 
-**Windows (PowerShell)**
+**Windows**
+
+In **PowerShell**:
 
 ```powershell
 irm https://raw.githubusercontent.com/Hadixel/glm-bridge/main/install.ps1 | iex
 ```
+
+In **cmd** — or one command that works in **both** PowerShell and cmd:
+
+```
+powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/Hadixel/glm-bridge/main/install.ps1 | iex"
+```
+
+There is no `curl … | bash` equivalent on Windows: there is no `bash`,
+and `curl` in PowerShell is an alias for `Invoke-WebRequest`, so the
+installer is a PowerShell script piped to `iex` instead.
 
 Both install to `~/.glm-bridge`, put `glm-bridge` on your PATH, start it at
 login (systemd user unit on Linux, Scheduled Task on Windows), and register it

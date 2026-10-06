@@ -55,7 +55,7 @@ if (Test-Path (Join-Path $InstallDir '.git')) {
   git clone --depth 1 $RepoUrl $InstallDir
 }
 
-foreach ($f in @('glm-bridge.js', 'mint-captcha.js', 'sysblocks.json', 'zbridge.js', 'tray.ps1')) {
+foreach ($f in @('glm-bridge.js', 'mint-captcha.js', 'sysblocks.json', 'zbridge.js', 'tray.ps1', 'patch-zcode.js')) {
   if (-not (Test-Path (Join-Path $InstallDir $f))) { Die "missing $f in repo" }
 }
 
@@ -98,11 +98,17 @@ if (-not (Test-Path (Join-Path $InstallDir 'node_modules\playwright-core'))) {
 # The bridge drives ZCode's own CLI. If missing, offer the official build
 # with size + explicit consent; install silently (no GUI opens), then offer
 # the CLI's terminal OAuth login.
+# Returns the path to the CLI the bridge will actually use
+# (GLM_BRIDGE_CLI, then the Windows installer location, then
+# our own extracted copy), or $null. Callers treat a path as
+# truthy and $null as falsy, so this stays drop-in compatible.
 function Find-ZcodeCli {
-  if ($env:GLM_BRIDGE_CLI -and (Test-Path $env:GLM_BRIDGE_CLI)) { return $true }
+  if ($env:GLM_BRIDGE_CLI -and (Test-Path $env:GLM_BRIDGE_CLI)) { return $env:GLM_BRIDGE_CLI }
   $p = Join-Path $env:LOCALAPPDATA 'Programs\ZCode\resources\glm\zcode.cjs'
-  if (Test-Path $p) { return $true }
-  return (Test-Path (Join-Path $InstallDir 'squashfs-root\resources\glm\zcode.cjs'))
+  if (Test-Path $p) { return $p }
+  $e = Join-Path $InstallDir 'squashfs-root\resources\glm\zcode.cjs'
+  if (Test-Path $e) { return $e }
+  return $null
 }
 $ZcodeUrl = if ($env:GLM_BRIDGE_ZCODE_URL) { $env:GLM_BRIDGE_ZCODE_URL } else { 'https://cdn-zcode.z.ai/zcode/electron/releases/3.14.4/windows-x64/ZCode-3.14.4-win-x64.exe' }
 if (-not (Find-ZcodeCli)) {
@@ -129,6 +135,30 @@ if (-not (Find-ZcodeCli)) {
   } else {
     Say 'skipped - install ZCode manually or re-run install.ps1'
   }
+}
+
+# ------------------------------------------------------ zcode reasoning patch
+# Forward GLM's reasoning out of the CLI so thinking blocks
+# reach clients. ZCode re-extracts the bundle on every
+# update, wiping this patch, so re-apply it whenever the
+# CLI is present. patch-zcode.js matches on structure (not
+# minified names), survives ZCode version changes, and is
+# idempotent.
+$zcodeCjs = Find-ZcodeCli
+$patcher = Join-Path $InstallDir 'patch-zcode.js'
+if ($zcodeCjs -and (Test-Path $patcher)) {
+  # Run node in the current scope so $LASTEXITCODE is
+  # reliable, and keep $ErrorActionPreference='Continue' so
+  # a non-zero exit (which writes to stderr) cannot abort
+  # the install on PowerShell 5.1.
+  $prevEap = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try {
+    & $node.Source $patcher $zcodeCjs 2>&1 | Out-Null
+    $patchCode = $LASTEXITCODE
+  } finally { $ErrorActionPreference = $prevEap }
+  if ($patchCode -eq 0) { Say 'zcode.cjs reasoning passthrough verified' }
+  else { Say 'warn: zcode.cjs reasoning patch failed - thinking blocks disabled (bridge still works)' }
 }
 
 # -------------------------------------------------------- terminal login ----

@@ -48,7 +48,7 @@ else
 fi
 
 # runtime files live next to the checkout; keep symlink targets valid
-for f in glm-bridge.js mint-captcha.js sysblocks.json zbridge.js tray.sh tray.py; do
+for f in glm-bridge.js mint-captcha.js sysblocks.json zbridge.js tray.sh tray.py patch-zcode.js; do
   [ -f "$INSTALL_DIR/$f" ] || die "missing $f in repo"
 done
 
@@ -117,6 +117,21 @@ if ! zcode_cli_found; then
       ;;
     *) say "skipped — the bridge will keep retrying; install ZCode manually or re-run install.sh" ;;
   esac
+fi
+
+# ------------------------------------------------- zcode reasoning patch --
+# Forward GLM's reasoning out of the CLI so thinking blocks reach
+# clients. ZCode re-extracts the bundle on every update, which
+# wipes this patch, so re-apply it whenever the CLI is present.
+# patch-zcode.js matches on structure (not minified names), so it
+# survives ZCode version changes, and is idempotent.
+ZCODE_CJS="$INSTALL_DIR/squashfs-root/resources/glm/zcode.cjs"
+if [ -f "$ZCODE_CJS" ] && [ -f "$INSTALL_DIR/patch-zcode.js" ]; then
+  if "$NODE_BIN" "$INSTALL_DIR/patch-zcode.js" "$ZCODE_CJS"; then
+    say "zcode.cjs reasoning passthrough verified"
+  else
+    say "warn: zcode.cjs reasoning patch failed — thinking blocks disabled (bridge still works)"
+  fi
 fi
 
 # ------------------------------------------------- terminal login ------------
