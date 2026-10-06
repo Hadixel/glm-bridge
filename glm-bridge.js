@@ -2298,7 +2298,19 @@ const server = http.createServer(async (req, res) => {
       ac.abort();
     }
   });
-  req.signal = ac.signal;
+  // Node 24.21+ exposes `signal` as a getter-only property on
+  // IncomingMessage, so a plain `req.signal = …` assignment
+  // throws "which has only a getter" and, because this handler
+  // is async, surfaces as an unhandledRejection on every
+  // request. Define an own property to shadow the getter; on
+  // builds where `signal` is absent or a plain writable field
+  // this behaves exactly like the assignment it replaces.
+  try {
+    Object.defineProperty(req, 'signal', { value: ac.signal, writable: true, configurable: true });
+  } catch {
+    // A non-configurable own getter (future Node): fall back to
+    // the native signal, which aborts when the connection closes.
+  }
   const url = new URL(req.url, 'http://localhost');
   try {
     if (url.pathname !== '/health') log(`[http] ${req.method} ${url.pathname} from port ${req.socket.remotePort} UA=${req.headers['user-agent'] || 'none'}`);
